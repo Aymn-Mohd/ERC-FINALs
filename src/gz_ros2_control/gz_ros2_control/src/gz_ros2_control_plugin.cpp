@@ -354,7 +354,26 @@ void GazeboSimROS2ControlPlugin::Configure(
   }
 
   std::string node_name = "gz_ros2_control";
-  this->dataPtr->node_ = rclcpp::Node::make_shared(node_name, ns);
+  // Pass the <parameters> files to THIS node as well as to the controller manager.
+  //
+  // Without this they only ever reach the controller manager, and every parameter the
+  // plugin itself declares is stuck at its compiled-in default however the simulation is
+  // configured. The one that matters here is position_proportional_gain, which converts a
+  // joint's position error into a velocity command:
+  //
+  //     target_vel = -position_proportional_gain * error       (gz_system.cpp)
+  //
+  // Its default of 0.1 drives a joint one radian from its target at 0.1 rad/s. On this
+  // robot that is an exponential crawl: commanded to a posture and left alone, the arm
+  // went from 0.71 rad of total error to 0.22 over fifty-five seconds and was still
+  // creeping. Trajectories reported complete while the arm was still travelling, and the
+  // grasp arrived tens of millimetres out however good the plan.
+  //
+  // The value itself now lives in erc_bringup/config/gazebo_controller_manager_cfg.yaml,
+  // where it can be read and changed, rather than in a constant in this file.
+  rclcpp::NodeOptions node_options;
+  node_options.arguments(arguments);
+  this->dataPtr->node_ = rclcpp::Node::make_shared(node_name, ns, node_options);
   this->dataPtr->executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
   this->dataPtr->executor_->add_node(this->dataPtr->node_);
   auto spin = [this]()

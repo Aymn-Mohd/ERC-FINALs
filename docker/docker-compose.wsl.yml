@@ -1,0 +1,35 @@
+# WSL2-ONLY override. Layer on top of the standard compose files:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml -f docker-compose.wsl.yml up -d
+#
+# or just run:  ./docker/up-wsl.sh
+#
+# WHY THIS IS NEEDED
+# On a WSL2 host, Linux OpenGL reaches the Windows GPU through Mesa's d3d12
+# Gallium driver. That driver needs libd3d12.so and libd3d12core.so, which live
+# in /usr/lib/wsl/lib on the host. The NVIDIA container toolkit injects CUDA
+# libraries and libdxcore.so but NOT those two, so inside the stock container
+# the d3d12 driver cannot reach the GPU and Mesa silently falls back to
+# llvmpipe software rendering. Gazebo then runs at a few FPS.
+#
+# Verified on this machine: without this file the container reports
+#   Device: llvmpipe (LLVM 15.0.7)                Accelerated: no
+# with it:
+#   Device: D3D12 (NVIDIA RTX A4500 Laptop GPU)   Accelerated: yes
+#
+# restart: unless-stopped is here because WSL tears the VM down when no session
+# is attached, which SIGKILLs the container (exit 255). This brings it back
+# automatically the next time the Docker service starts.
+#
+# DO NOT USE ON A NATIVE LINUX HOST. Forcing GALLIUM_DRIVER=d3d12 where no
+# D3D12 layer exists will break rendering outright. That is exactly why this
+# lives in a separate opt-in file rather than in docker-compose.yml.
+services:
+  erc:
+    restart: unless-stopped
+    environment:
+      - GALLIUM_DRIVER=d3d12
+      - MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl

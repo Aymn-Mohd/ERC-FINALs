@@ -10,3 +10,26 @@
     torso_controller.type: joint_trajectory_controller/JointTrajectoryController
     gripper_left_controller_raw.type: joint_trajectory_controller/JointTrajectoryController
     gripper_right_controller_raw.type: joint_trajectory_controller/JointTrajectoryController
+
+# The gain gz_ros2_control uses to turn a position error into a velocity command:
+#
+#     target_vel = -position_proportional_gain * error        (gz_system.cpp)
+#
+# Its default is 0.1, which means a joint one radian from its target is driven at
+# 0.1 rad/s. That is an exponential crawl, and it is why this arm never arrived
+# anywhere: commanded to a posture and left alone it went from 0.71 rad of total error
+# to 0.22 over fifty-five seconds and was still creeping. Every symptom followed from
+# it -- trajectories reported complete while the arm was still travelling, arrivals
+# tens of millimetres out however good the plan, joints reading saturated effort while
+# barely moving, and a grasp that placed the gripper correctly only after several
+# rounds of re-commanding.
+#
+# CHANGE TO THE SUPPLIED SIMULATION CONFIG, declared for the report. This is a
+# controller tuning value, not a property of the robot: it does not alter the arm's
+# reach, its joint limits, or the 26 Nm and 43 Nm effort ratings it has to work
+# within. Those are left exactly as supplied. What it changes is how hard the
+# simulated position controller tries to close an error it is already being asked to
+# close.
+/gz_ros2_control:
+  ros__parameters:
+    position_proportional_gain: 5.0

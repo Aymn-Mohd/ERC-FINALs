@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Run one of this project's tools inside the simulator container.
+#
+# Only src/ is mounted into the container, not tools/, so a tool cannot be executed by
+# path from inside it. This pipes the tool in on stdin with ROS sourced, which is what
+# every invocation in this project has done by hand until now.
+#
+#     tools/in-sim place_robot.py book_col_3_row_3_yellow 0.68
+#     tools/in-sim ideal_grasp.py book_col_3_row_3_yellow
+#     tools/in-sim tuck_arm.py 55
+#
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ $# -lt 1 ]; then
+    echo "usage: tools/in-sim <tool.py> [args...]"
+    echo
+    echo "available:"
+    ls "$HERE"/*.py | xargs -n1 basename | sed 's/^/    /'
+    exit 1
+fi
+TOOL="$1"; shift
+[ -f "$HERE/$TOOL" ] || { echo "no such tool: $TOOL"; exit 1; }
+exec docker exec -i erc_sim /entrypoint.sh bash -c \
+    "source /opt/erc_ws/install/setup.bash && python3 - $*" < "$HERE/$TOOL"

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Semantic description of TIAGo Pro for MoveIt.
+
+  There is no SRDF anywhere in the competition image, only MoveIt's own test fixtures,
+  which is why the first version of this solution drove the arm from hand-written IK
+  instead. That worked for placing the gripper and not for getting it there: the arm has
+  four spare degrees of freedom and no notion of what it is about to hit, so it reached
+  correct points by paths that went through the shelf. Contact sensors caught arm_left_6
+  at world z=0.44, below the lowest shelf surface at 0.587, while its target sat at 1.247.
+
+  This file exists so MoveIt can plan those motions instead. It is written by hand rather
+  than by the Setup Assistant, which needs a display; the disable_collisions list below is
+  generated headlessly by collisions_updater and should be regenerated with it, not edited.
+
+  ASSUMPTION, declared for the report: the base is treated as fixed during manipulation.
+  The virtual joint is fixed rather than planar, and the shelf is given to the planning
+  scene in base_link coordinates measured from the robot's own sensors. The robot does not
+  drive while the arm is out, so this holds, and it keeps planning independent of odometry
+  drift.
+-->
+<robot name="tiago_pro">
+
+  <!-- The arm group deliberately includes the torso lift. It is what puts the gripper at
+       shelf heights at all: the four rows span 0.401 to 1.391 m in base_link and the arm
+       alone cannot cover that. This is the same eight-joint chain the analytic kinematics
+       in avaa_solution/kinematics/arm_chain.py uses, so the two agree about what the arm
+       is. -->
+  <group name="arm_left_torso">
+    <chain base_link="base_link" tip_link="gripper_left_grasping_link"/>
+  </group>
+
+  <!-- The arm without the torso, for motions that should not change height. -->
+  <group name="arm_left">
+    <chain base_link="torso_lift_link" tip_link="gripper_left_grasping_link"/>
+  </group>
+
+  <group name="gripper_left">
+    <joint name="gripper_left_finger_joint"/>
+  </group>
+
+  <end_effector name="gripper_left_ee"
+                parent_link="gripper_left_grasping_link"
+                group="gripper_left"
+                parent_group="arm_left_torso"/>
+
+  <!-- Poses this solution actually commands, so they can be named in plans and in the
+       report rather than repeated as magic numbers. -->
+  <!-- Folded and collision free, which the obvious tuck is not: all the negatives,
+       [-0.5, -2.4, 0, -2.4, 0, 0, 0], puts arm_left_2 through arm_left_5 against
+       torso_base_link and torso_lift_link. Gazebo does not check self-collision so it
+       went unnoticed for the whole project, and MoveIt would not plan from it at all.
+       Found by sampling folded postures against /check_state_validity, keeping the most
+       compact with 0.15 rad of room at every stop. See tools/find_tuck.py. -->
+  <group_state name="tuck" group="arm_left_torso">
+    <joint name="torso_lift_joint" value="0.15"/>
+    <joint name="arm_left_1_joint" value="2.1521"/>
+    <joint name="arm_left_2_joint" value="0.3824"/>
+    <joint name="arm_left_3_joint" value="1.2785"/>
+    <joint name="arm_left_4_joint" value="-2.1517"/>
+    <joint name="arm_left_5_joint" value="0.8325"/>
+    <joint name="arm_left_6_joint" value="0.1926"/>
+    <joint name="arm_left_7_joint" value="1.3944"/>
+  </group_state>
+
+  <group_state name="open" group="gripper_left">
+    <joint name="gripper_left_finger_joint" value="0.040"/>
+  </group_state>
+
+  <!-- -0.001 is the joint's lower limit, about 27.7 mm between the fingertips. The
+       obvious 0.000 leaves them 30.4 mm apart, measured from TF, around a book that is
+       30.0 mm thick: the jaws closed with 0.2 mm to spare and gripped nothing. -->
+  <group_state name="clamped" group="gripper_left">
+    <joint name="gripper_left_finger_joint" value="-0.001"/>
+  </group_state>
+
+  <virtual_joint name="world_joint" type="fixed"
+                 parent_frame="world" child_link="base_footprint"/>
+
+</robot>

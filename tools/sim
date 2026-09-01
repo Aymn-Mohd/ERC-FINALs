@@ -1,0 +1,305 @@
+#!/bin/bash
+# AVAA / ERC 2026 simulation helper.
+#
+#   sim start     bring the container up (if needed), build (if needed), launch Gazebo
+#   sim stop      stop the simulation but leave the container running
+#   sim restart   stop then start
+#   sim shell     open a shell inside the container, ROS already sourced
+#   sim status    what is running right now
+#   sim log       follow the simulation log
+#   sim build     rebuild the ROS workspace
+#   sim rebuild   recreate the container from scratch (destroys install/ and build/)
+#
+# Safe to run from any directory, in any Ubuntu terminal.
+
+set -u
+
+REPO="$HOME/erc/erc_sim_2026"
+CONTAINER="erc_sim"
+WS="/opt/erc_ws"
+LAUNCH="ros2 launch erc_bringup simulation.launch.py"
+
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+ylw()  { printf '\033[33m%s\033[0m\n' "$*"; }
+
+container_running() {
+    [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]
+}
+
+sim_running() {
+    # Two shapes to match. With the GUI, Gazebo forks a process literally named
+    # "gz sim server". Headless, there is no such fork -- it is a single "gz sim -r -s".
+    # Matching only the first made a healthy headless simulation look dead.
+    docker exec "$CONTAINER" pgrep -f '[g]z sim server' >/dev/null 2>&1 && return 0
+    docker exec "$CONTAINER" pgrep -f '[g]z sim -r -s' >/dev/null 2>&1
+}
+
+# A launch that has been issued but whose Gazebo has not appeared yet. Checking only for
+# 'gz sim server' is not enough: Gazebo takes several seconds to come up, and a second
+# 'sim start' in that window would fire a second simulation. That leaves two sets of
+# bridge nodes fighting over the same topics, which is confusing and hard to spot.
+sim_launching() {
+    docker exec "$CONTAINER" pgrep -f '[r]os2 launch erc_bringup' >/dev/null 2>&1
+}
+
+workspace_built() {
+    docker exec "$CONTAINER" test -f "$WS/install/setup.bash" >/dev/null 2>&1
+}
+
+ensure_container() {
+    if container_running; then
+        return 0
+    fi
+    ylw "Container not running - starting it..."
+    if docker start "$CONTAINER" >/dev/null 2>&1; then
+        sleep 3
+    else
+        ylw "No existing container. Creating one (this destroys any old build)..."
+        (cd "$REPO" && ./docker/up-wsl.sh >/dev/null 2>&1)
+        sleep 4
+    fi
+    container_running || { red "Could not start the container."; return 1; }
+    grn "Container up."
+}
+
+ensure_built() {
+    if workspace_built; then
+        return 0
+    fi
+    ylw "Workspace not built (normal after the container is recreated). Building..."
+    docker exec "$CONTAINER" /entrypoint.sh bash -c "cd $WS && colcon build --symlink-install" \
+        2>&1 | tail -3
+    workspace_built || { red "Build failed."; return 1; }
+    grn "Build complete."
+}
+
+cmd_start() {
+    ensure_container || return 1
+    ensure_built || return 1
+    if sim_running; then
+        ylw "Simulation is already running. Use 'sim restart' to relaunch it."
+        return 0
+    fi
+    if sim_launching; then
+        ylw "A launch is already in progress. Waiting for it rather than starting a second."
+        for _ in $(seq 1 40); do
+            sleep 1
+            sim_running && break
+        done
+        if sim_running; then
+            grn "Gazebo is running."
+            sleep 2
+            unminimize_window
+            return 0
+        fi
+        red "That launch did not produce a running Gazebo. Try: sim restart"
+        return 1
+    fi
+    # Anything left over from a previous run competes for the same cores.
+    stop_orphans
+
+    local launch_args=""
+    local want_window=1
+    for arg in "$@"; do
+        case "$arg" in
+            --fast)
+                # depth_to_cloud rebuilds the point cloud from the depth image and costs
+                # about a full core. Perception currently uses RGB only, so for
+                # development this is pure overhead. Leave it enabled for scored runs if
+                # manipulation needs the cloud.
+                launch_args="$launch_args depth_cloud:=false"
+                ylw "Fast mode: depth point cloud disabled."
+                ;;
+            --headless)
+                # No Gazebo GUI. Worth knowing why this exists: the GUI's Qt/GLX OpenGL
+                # context is what dies when WSL drops the virtual GPU
+                # ("D3D12: Removing Device" followed by a fallback to swrast and an
+                # abort). The server keeps rendering camera images through EGL, so
+                # perception still works. It also frees the ~120% CPU the GUI uses.
+                # Use the GUI for recording the deliverable video, headless for
+                # development.
+                launch_args="$launch_args headless:=true"
+                want_window=0
+                ylw "Headless: no Gazebo window."
+                ;;
+            *)
+                ylw "Ignoring unknown option: $arg"
+                ;;
+        esac
+    done
+
+    ylw "Launching Gazebo..."
+    docker exec -d "$CONTAINER" /entrypoint.sh bash -c \
+        "source $WS/install/setup.bash && exec $LAUNCH $launch_args > /tmp/sim.log 2>&1"
+    for _ in $(seq 1 40); do
+        sleep 1
+        sim_running && break
+    done
+    if ! sim_running; then
+        red "Simulation did not start. Check: sim log"
+        return 1
+    fi
+    grn "Gazebo is running."
+    if [ "$want_window" -eq 0 ]; then
+        return 0
+    fi
+    # WSLg maps the window minimized when Gazebo is launched from a detached
+    # process, and the taskbar button does not reliably restore it. Un-minimize
+    # it from the Windows side.
+    sleep 3
+    unminimize_window
+    echo
+    echo "The title bar reads '[WARN:COPY MODE] Gazebo Sim'. That is a WSLg"
+    echo "message about how the window is delivered to Windows. It is not an"
+    echo "error and it does not mean software rendering."
+}
+
+unminimize_window() {
+    local script="D:\\Projects\\Emirates Robotics Competition\\tools\\restore-gazebo.ps1"
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+        ylw "powershell.exe not on PATH - if the window stays minimized, restore it manually."
+        return 0
+    fi
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script" 2>/dev/null \
+        | tr -d '\r' | sed 's/^/  /'
+}
+
+# Nodes the simulation launch spawns as children. Killing the launch process leaves these
+# orphaned and running, and they are not cheap: two stray depth_to_cloud processes burn
+# roughly two cores between them, which dragged the real-time factor from ~0.58 down to
+# ~0.35 and made the whole simulation look slower than it is.
+ORPHAN_PATTERNS=(
+    '[d]epth_to_cloud'
+    '[p]arameter_bridge'
+    '[r]obot_state_publisher'
+    '[g]ripper_command_clamp'
+    '[s]pawner'
+    # Our own nodes too. Restarting the simulation leaves them talking to a Gazebo that no
+    # longer exists, and the next run then stacks a second copy on top: two approach
+    # controllers fighting over /cmd_vel, two robot_state_publishers producing
+    # TF_OLD_DATA, and a real-time factor down at 0.08. Every measurement taken in that
+    # state is worthless, and it is not obvious from the logs that anything is wrong.
+    'avaa_solution/lib'
+)
+
+stop_orphans() {
+    for pattern in "${ORPHAN_PATTERNS[@]}"; do
+        docker exec "$CONTAINER" pkill -f "$pattern" >/dev/null 2>&1
+    done
+    sleep 1
+    for pattern in "${ORPHAN_PATTERNS[@]}"; do
+        docker exec "$CONTAINER" pkill -9 -f "$pattern" >/dev/null 2>&1
+    done
+}
+
+cmd_stop() {
+    container_running || { ylw "Container is not running."; return 0; }
+    if ! sim_running && ! sim_launching; then
+        # Still sweep up strays. A launch whose Gazebo crashed leaves the launch process
+        # and its bridge children alive, and the next 'sim start' then refuses to run
+        # because it sees a launch already in progress.
+        ylw "Simulation was not running (clearing any strays)."
+        docker exec "$CONTAINER" pkill -f '[r]os2 launch erc_bringup' >/dev/null 2>&1
+        stop_orphans
+        return 0
+    fi
+    # SIGTERM first so Gazebo shuts down cleanly. It can take several seconds,
+    # so wait for the process to actually disappear rather than assuming.
+    docker exec "$CONTAINER" pkill -f '[r]os2 launch erc_bringup' >/dev/null 2>&1
+    docker exec "$CONTAINER" pkill -f '[g]z sim'                  >/dev/null 2>&1
+    stop_orphans
+    for _ in $(seq 1 20); do
+        sim_running || break
+        sleep 1
+    done
+    if sim_running; then
+        ylw "Still running after 20s - forcing."
+        docker exec "$CONTAINER" pkill -9 -f '[g]z sim'      >/dev/null 2>&1
+        docker exec "$CONTAINER" pkill -9 -f '[r]os2 launch' >/dev/null 2>&1
+        sleep 2
+    fi
+    if sim_running; then
+        red "Could not stop the simulation."
+        return 1
+    fi
+    grn "Simulation stopped (container left running)."
+}
+
+cmd_shell() {
+    ensure_container || return 1
+    echo "Entering the container. ROS 2 is sourced. Type 'exit' to leave."
+    docker exec -it "$CONTAINER" /entrypoint.sh bash -c \
+        "[ -f $WS/install/setup.bash ] && source $WS/install/setup.bash; cd $WS; exec bash"
+}
+
+cmd_status() {
+    echo "== WSL =="
+    echo "  distro : $(uname -r)"
+    echo
+    echo "== Docker =="
+    if container_running; then
+        grn "  container : running"
+    else
+        red "  container : STOPPED"
+    fi
+    echo
+    echo "== Workspace =="
+    if container_running && workspace_built; then
+        grn "  build     : present"
+    else
+        red "  build     : missing (run 'sim build')"
+    fi
+    echo
+    echo "== Simulation =="
+    if container_running && sim_running; then
+        grn "  gazebo    : running"
+        local rtf
+        rtf=$(docker exec "$CONTAINER" /entrypoint.sh bash -c \
+              "timeout 6 gz topic -t /stats -e -n 1 2>/dev/null | grep real_time_factor" 2>/dev/null)
+        [ -n "$rtf" ] && echo "  $rtf"
+    else
+        red "  gazebo    : not running (run 'sim start')"
+    fi
+}
+
+cmd_log() {
+    container_running || { red "Container is not running."; return 1; }
+    docker exec "$CONTAINER" tail -f /tmp/sim.log
+}
+
+cmd_build() {
+    ensure_container || return 1
+    docker exec "$CONTAINER" /entrypoint.sh bash -c "cd $WS && colcon build --symlink-install" \
+        2>&1 | tail -5
+}
+
+cmd_rebuild() {
+    ylw "Recreating the container. install/ and build/ will be destroyed."
+    (cd "$REPO" && ./docker/up-wsl.sh)
+    sleep 4
+    ensure_built
+}
+
+case "${1:-}" in
+    start)   shift; cmd_start "$@" ;;
+    stop)    cmd_stop    ;;
+    restart) shift; cmd_stop; cmd_start "$@" ;;
+    shell)   cmd_shell   ;;
+    status)  cmd_status  ;;
+    log)     cmd_log     ;;
+    build)   cmd_build   ;;
+    rebuild) cmd_rebuild ;;
+    *)
+        echo "AVAA simulation helper"
+        echo
+        echo "  sim start     launch Gazebo (starts container + builds if needed)"
+        echo "  sim stop      stop Gazebo, keep the container"
+        echo "  sim restart   stop then start"
+        echo "  sim shell     shell inside the container, ROS 2 sourced"
+        echo "  sim status    show what is running"
+        echo "  sim log       follow the simulation log"
+        echo "  sim build     rebuild the ROS workspace"
+        echo "  sim rebuild   recreate the container from scratch"
+        ;;
+esac
