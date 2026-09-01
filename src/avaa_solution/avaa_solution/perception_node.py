@@ -39,6 +39,7 @@ from vision_msgs.msg import (
     ObjectHypothesisWithPose,
 )
 
+from avaa_solution.vision import bin_detector as bnd
 from avaa_solution.vision import book_detector as bd
 from avaa_solution.vision import marker_reader as mr
 
@@ -49,6 +50,7 @@ TOPIC_DEPTH = "/head_front_camera/head_front_camera/depth/image_rect_raw"
 TOPIC_DEPTH_INFO = "/head_front_camera/head_front_camera/depth/camera_info"
 TOPIC_TARGET_COLUMN = "/avaa/perception/target_column"
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
+TOPIC_BIN_X = "/avaa/perception/bin_x"
 TOPIC_TARGET_BOOK_POINT = "/avaa/perception/target_book_point"
 
 # Where the grasp controller wants the book expressed.
@@ -137,6 +139,7 @@ class PerceptionNode(Node):
         self.pub_row = self.create_publisher(Int32, TOPIC_TARGET_ROW, 10)
         self.pub_column = self.create_publisher(Int32, TOPIC_TARGET_COLUMN, 10)
         self.pub_column_x = self.create_publisher(Float32, TOPIC_TARGET_COLUMN_X, 10)
+        self.pub_bin_x = self.create_publisher(Float32, TOPIC_BIN_X, 10)
 
         self.create_timer(float(self.get_parameter("detect_period_sec").value), self._process)
 
@@ -318,6 +321,13 @@ class PerceptionNode(Node):
         if self.latest_frame is None:
             return
         frame = self.latest_frame
+
+        # Independent of column/row identification -- the bin only matters once a book
+        # has been found, but the check is cheap and runs every frame regardless, so the
+        # approach controller has a bearing on it as soon as it starts looking.
+        bin_cx = bnd.find_bin_centre_x(frame)
+        if bin_cx is not None and bnd.is_looking_at_bin(frame):
+            self.pub_bin_x.publish(Float32(data=float(bin_cx)))
 
         try:
             books = bd.detect_books(frame)

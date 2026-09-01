@@ -16,6 +16,9 @@ Sequence:
     SQUARE   sit perpendicular to the shelf face, fitted from the LiDAR
     VERIFY   confirm the book is still held in view before handing over to the grasp
     RETREAT  back off and re-acquire when it is not; twice, then give up
+    BIN_SEARCH   (if return_to_bin) turn on the spot until the collection bin is seen
+    BIN_CENTRE   rotate until the bin sits in the middle of the image
+    BIN_APPROACH drive in on LiDAR range until the bin is at bin_standoff_m
     DONE
 
 Lateral motion is commanded, and turning is not, once the arms are tucked. Rotating to
@@ -44,7 +47,7 @@ from geometry_msgs.msg import PointStamped, Twist
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import JointState, LaserScan
 from builtin_interfaces.msg import Duration
 from std_msgs.msg import Float32, Int32, String
 from tf2_ros import Buffer, TransformListener
@@ -82,12 +85,14 @@ SELF_FILTER_RADIUS = 0.45
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
+TOPIC_BIN_X = "/avaa/perception/bin_x"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
 TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
 TOPIC_TORSO = "/torso_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
 TOPIC_STATE = "/avaa/approach/state"
 TOPIC_CMD = "/cmd_vel"
+TOPIC_JOINT_STATES = "/joint_states"
 
 SENSOR_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -157,6 +162,9 @@ class State(Enum):
     VERIFY = "verifying"
     RETREAT = "retreating"
     SQUARE = "squaring"
+    BIN_SEARCH = "bin_searching"
+    BIN_CENTRE = "bin_centring"
+    BIN_APPROACH = "bin_approaching"
     DONE = "done"
     FAILED = "failed"
 
@@ -201,6 +209,11 @@ class ApproachNode(Node):
         self.declare_parameter("search_timeout_sec", 150.0)
         self.declare_parameter("image_width_px", 640)
         self.declare_parameter("tuck_time_sec", 5.0)
+        # Where to stop in front of the collection bin, and whether to go there at all.
+        # Picking/placing is not built yet -- this just gets the base into position.
+        self.declare_parameter("return_to_bin", True)
+        self.declare_parameter("bin_standoff_m", 0.70)
+        self.declare_parameter("bin_standoff_tolerance_m", 0.05)
 
         self.standoff = float(self.get_parameter("standoff_m").value)
         self.centre_tol = float(self.get_parameter("centre_tolerance_px").value)
@@ -215,9 +228,15 @@ class ApproachNode(Node):
         self.search_timeout = float(self.get_parameter("search_timeout_sec").value)
         self.image_width = int(self.get_parameter("image_width_px").value)
         self.tuck_time = float(self.get_parameter("tuck_time_sec").value)
+        self.return_to_bin = bool(self.get_parameter("return_to_bin").value)
+        self.bin_standoff = float(self.get_parameter("bin_standoff_m").value)
+        self.bin_standoff_tol = float(self.get_parameter("bin_standoff_tolerance_m").value)
 
         self.column_cx: Optional[float] = None
         self.column_cx_at: Optional[float] = None
+        self.bin_cx: Optional[float] = None
+        self.bin_cx_at: Optional[float] = None
+        self.bin_head_levelled = False
         self.scan: Optional[LaserScan] = None
         self.state = State.WAITING
         self.state_since = self._now()
@@ -283,8 +302,16 @@ class ApproachNode(Node):
         self.book_hold_time = 3.0
         self.verify_aimed_at: Optional[float] = None
         self.book_held_since: Optional[float] = None
+        # Whether the tuck command has actually gone out (a JointTrajectory published
+        # before the controller has matched the subscription is dropped in silence --
+        # see _send/_do_tuck), and the joint positions it is going to.
+        self.joints: dict = {}
+        self.tuck_sent = False
+        self.tuck_sent_at: Optional[float] = None
+        self.create_subscription(JointState, TOPIC_JOINT_STATES, self._on_joints, 10)
         self.create_subscription(
             PointStamped, TOPIC_BOOK_POINT, self._on_book_point, 10)
+        self.create_subscription(Float32, TOPIC_BIN_X, self._on_bin_x, 10)
         self.row_heights = list(
             self.get_parameter("row_heights").value or DEFAULT_ROW_HEIGHTS)
         self.pub_head = self.create_publisher(
@@ -324,6 +351,22 @@ class ApproachNode(Node):
         if (self._now() - self.column_cx_at) > max_age:
             return None
         return self.column_cx
+
+    def _on_bin_x(self, msg: Float32) -> None:
+        self.bin_cx = float(msg.data)
+        self.bin_cx_at = self._now()
+
+    def _bin_cx_fresh(self, max_age: float = 1.5) -> Optional[float]:
+        """Give the bin's image x, or None if perception has gone quiet on it."""
+        if self.bin_cx is None or self.bin_cx_at is None:
+            return None
+        if (self._now() - self.bin_cx_at) > max_age:
+            return None
+        return self.bin_cx
+
+    def _on_joints(self, msg: JointState) -> None:
+        for name, position in zip(msg.name, msg.position):
+            self.joints[name] = position
 
     def _on_scan(self, msg: LaserScan) -> None:
         self.scan = msg
@@ -451,6 +494,11 @@ class ApproachNode(Node):
             self.target_odom = None
             self.anchor_candidates.clear()
             self.anchor_disagree.clear()
+        if state is State.TUCK:
+            self.tuck_sent = False
+            self.tuck_sent_at = None
+        if state is State.BIN_SEARCH:
+            self.bin_head_levelled = False
         if state is not self.state:
             self.get_logger().info(f"{self.state.value} -> {state.value}")
             self.state = state
@@ -476,11 +524,19 @@ class ApproachNode(Node):
             # Stow the arms before anything moves, then go looking for the marker. The
             # robot's start pose is not guaranteed to face the shelves -- in practice it
             # spawns facing a wall -- so searching is part of the task, not a fallback.
-            self._send_tuck()
+            # _do_tuck() owns actually sending the command, once something is listening.
             self._enter(State.TUCK)
             return
 
-        budget = self.search_timeout if self.state is State.SEARCH else self.timeout
+        # BIN_SEARCH rotates in place the same way SEARCH does, and needs the same
+        # generous budget for a full sweep -- it inherited the short generic timeout
+        # at first and gave up after two full rotations, well before ever finding
+        # the bin. BIN_APPROACH gets the same long budget too: the bin sits roughly
+        # 6 m from where the shelf leg ends, several times the shelf APPROACH's own
+        # distances that state_timeout_sec was sized for.
+        budget = (self.search_timeout
+                  if self.state in (State.SEARCH, State.BIN_SEARCH, State.BIN_APPROACH)
+                  else self.timeout)
         if self._elapsed() > budget:
             self.get_logger().error(f"timed out in {self.state.value}")
             self._stop()
@@ -489,12 +545,15 @@ class ApproachNode(Node):
 
         # Safety floor applies in every moving state.
         nearest = self._min_range_ahead()
-        if nearest is not None and nearest < self.min_safe and self.state is State.APPROACH:
+        if (nearest is not None and nearest < self.min_safe
+                and self.state in (State.APPROACH, State.BIN_APPROACH)):
             self.get_logger().warn(
                 f"safety stop: obstacle at {nearest:.2f} m < {self.min_safe:.2f} m"
             )
             self._stop()
-            self._enter(State.SQUARE)
+            # SQUARE is shelf-specific (fits a LiDAR line to a wide flat face); the bin
+            # leg has no equivalent step, so an obstacle there just ends the run.
+            self._enter(State.SQUARE if self.state is State.APPROACH else State.DONE)
             return
 
         if self.state is State.TUCK:
@@ -513,44 +572,96 @@ class ApproachNode(Node):
             self._do_approach()
         elif self.state is State.SQUARE:
             self._do_square()
+        elif self.state is State.BIN_SEARCH:
+            self._do_bin_search()
+        elif self.state is State.BIN_CENTRE:
+            self._do_bin_centre()
+        elif self.state is State.BIN_APPROACH:
+            self._do_bin_approach()
 
-    def _send_tuck(self) -> None:
-        """Command both arms to the driving posture."""
+    def _send(self, pub, names: List[str], values: List[float], seconds: float) -> bool:
+        """Publish a single-point JointTrajectory, but only if something is listening.
+
+        A trajectory published before the controller has matched the subscription is
+        dropped in silence -- grasp_node.py hit this first (commit 1b9ade0) and the fix
+        is mirrored here: check the subscriber count, send once, and let the caller
+        retry only when nothing was listening. Re-sending a command that did arrive is
+        worse than not sending it -- each new JointTrajectory replaces the one in
+        progress and restarts its time_from_start, so a trajectory re-sent on a timer
+        never finishes. That was the actual cause of the jittery startup tuck: several
+        resends landed in the controller's first half-second, each yanking the arm back
+        to the start of the spline.
+        """
+        if pub.get_subscription_count() == 0:
+            self.get_logger().warn(
+                f"nothing is listening on {pub.topic_name} yet; holding the command",
+                throttle_duration_sec=2.0)
+            return False
+        traj = JointTrajectory()
+        traj.joint_names = list(names)
+        point = JointTrajectoryPoint()
+        point.positions = [float(v) for v in values]
+        point.time_from_start = Duration(
+            sec=int(seconds), nanosec=int((seconds % 1.0) * 1e9))
+        traj.points = [point]
+        pub.publish(traj)
+        return True
+
+    def _send_tuck(self) -> bool:
+        """Command both arms and the torso to the driving posture.
+
+        Only once something is listening on every one of the three controllers.
+        Returns whether all three commands actually went out this call.
+        """
+        ok = True
         for pub, side in ((self.pub_arm_left, "left"), (self.pub_arm_right, "right")):
-            traj = JointTrajectory()
-            traj.joint_names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
-            point = JointTrajectoryPoint()
-            pose = list(RIGHT_TUCK) if side == "right" else list(TUCK_POSE)
-            point.positions = [float(v) for v in pose]
-            point.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
-            traj.points = [point]
-            pub.publish(traj)
+            names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
+            pose = RIGHT_TUCK if side == "right" else TUCK_POSE
+            ok = self._send(pub, names, pose, self.tuck_time) and ok
+        ok = self._send(
+            self.pub_torso, ["torso_lift_joint"], [TUCK_TORSO], self.tuck_time) and ok
+        if ok:
+            self.get_logger().info("stowing arms for driving")
+        return ok
 
-        # And the torso with them, or the folded arm sits inside the base.
-        torso = JointTrajectory()
-        torso.joint_names = ["torso_lift_joint"]
-        lift = JointTrajectoryPoint()
-        lift.positions = [float(TUCK_TORSO)]
-        lift.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
-        torso.points = [lift]
-        self.pub_torso.publish(torso)
-        self.get_logger().info("stowing arms for driving")
+    def _tuck_gap(self) -> Optional[float]:
+        """Sum the joint-space distance from the tuck target.
+
+        Returns None until every joint the tuck touches has reported at least once.
+        """
+        names = ([f"arm_left_{i}_joint" for i in range(1, 8)]
+                 + [f"arm_right_{i}_joint" for i in range(1, 8)]
+                 + ["torso_lift_joint"])
+        targets = list(TUCK_POSE) + list(RIGHT_TUCK) + [TUCK_TORSO]
+        try:
+            actual = [self.joints[name] for name in names]
+        except KeyError:
+            return None
+        return float(sum(abs(a - t) for a, t in zip(actual, targets)))
 
     def _do_tuck(self) -> None:
         self._stop()  # no driving until the arms are in
-        elapsed = self._now() - self.state_since
 
-        # Repeat only during the first moment, to cover the controller not yet being
-        # subscribed. Repeating later is actively harmful: each JointTrajectory replaces
-        # the one in progress and restarts its time_from_start, so a trajectory re-sent
-        # every two seconds never finishes. That left the arm permanently mid-sweep, and
-        # since the tuck path crosses the LiDAR plane the moving arm registered as an
-        # obstacle 0.08 m ahead the instant driving began.
-        if elapsed < 0.6:
-            self._send_tuck()
+        if not self.tuck_sent:
+            self.tuck_sent = self._send_tuck()
+            if self.tuck_sent:
+                self.tuck_sent_at = self._now()
 
-        # Wait out the full trajectory plus settling before allowing any motion.
-        if elapsed >= self.tuck_time + 2.0:
+        # Verify arrival from /joint_states rather than assuming the trajectory was
+        # followed -- grasp_node measured this arm taking about three times the
+        # commanded time_from_start to actually get there. tools/tuck_arm.py's own
+        # check (sum of joint-space error, warn past 0.5 rad) is mirrored here.
+        if self.tuck_sent:
+            gap = self._tuck_gap()
+            if gap is not None and gap <= 0.5:
+                self._enter(State.SEARCH)
+                return
+
+        # Don't wait forever if the tuck is never confirmed -- proceed anyway rather
+        # than stall the whole run over a simulation hiccup.
+        if self._elapsed() >= self.tuck_time + 5.0:
+            self.get_logger().warn(
+                "tuck not confirmed via /joint_states in time; proceeding anyway")
             self._enter(State.SEARCH)
 
     def _do_search(self) -> None:
@@ -573,6 +684,98 @@ class ApproachNode(Node):
         self.get_logger().info(
             f"searching for marker... ({self._elapsed():.0f}s)",
             throttle_duration_sec=5.0,
+        )
+
+    def _do_bin_search(self) -> None:
+        """Rotate on the spot until the collection bin comes into view.
+
+        Same idiom as _do_search, keyed on the bin instead of the column marker: the
+        bin's world pose is fixed, but dead-reckoning back to it is not trusted any more
+        here than it is for the shelf -- the base has no lateral wheel friction and
+        nothing bounds how far odom can drift over a multi-metre return trip.
+        """
+        if not self.bin_head_levelled:
+            # The head is likely still tilted down from row-scanning. The bin sits at a
+            # fixed, roughly chest-height pose and doesn't need that per-row tilt.
+            self.bin_head_levelled = self._send(
+                self.pub_head, ["head_1_joint", "head_2_joint"], [0.0, 0.0], 1.0)
+
+        if self._bin_cx_fresh() is not None:
+            self._stop()
+            self.get_logger().info("collection bin found")
+            self._enter(State.BIN_CENTRE)
+            return
+
+        cmd = Twist()
+        cmd.angular.z = self.search_rate
+        self.pub_cmd.publish(cmd)
+        self.get_logger().info(
+            f"searching for the bin... ({self._elapsed():.0f}s)",
+            throttle_duration_sec=5.0,
+        )
+
+    def _do_bin_centre(self) -> None:
+        bin_cx = self._bin_cx_fresh()
+        if bin_cx is None:
+            self._stop()
+            self._enter(State.BIN_SEARCH)
+            return
+        error_px = bin_cx - self.image_width / 2.0
+        if abs(error_px) <= self.centre_tol:
+            self._stop()
+            self._enter(State.BIN_APPROACH)
+            return
+        cmd = Twist()
+        cmd.angular.z = -math.copysign(
+            min(self.max_yaw, 0.004 * abs(error_px) + 0.08), error_px
+        )
+        self.pub_cmd.publish(cmd)
+
+    def _do_bin_approach(self) -> None:
+        """Drive in on LiDAR range until the bin is at bin_standoff_m.
+
+        Correcting sideways, not by turning -- measured live: turning to chase the
+        bearing while driving forward let the error run away from -10px to +170px over
+        a ~6 m return trip, wz pinned at max_yaw the whole time, never recovering. That
+        is the same failure the shelf leg's own _do_approach documents (turning while
+        driving converts a small angular error into a growing lateral excursion); it
+        was wrong to assume it was specific to staying square to a flat face. The base
+        strafes cleanly with the arms stowed, so lateral error is taken out directly
+        instead, mirroring _do_approach's marker-bearing fallback branch.
+        """
+        bin_cx = self._bin_cx_fresh()
+        if bin_cx is None:
+            # Lost it on the way in; go find it again rather than driving blind.
+            self._stop()
+            self._enter(State.BIN_SEARCH)
+            return
+
+        ahead = self._range_ahead()
+        if ahead is None:
+            self.get_logger().warn("no forward LiDAR returns; holding", throttle_duration_sec=3.0)
+            self._stop()
+            return
+
+        remaining = ahead - self.bin_standoff
+        if remaining <= self.bin_standoff_tol:
+            self._stop()
+            self.get_logger().info(f"arrived at the bin, ready to place ({ahead:.2f} m)")
+            self._enter(State.DONE)
+            return
+
+        error_px = bin_cx - self.image_width / 2.0
+        cmd = Twist()
+        cmd.linear.x = min(self.max_fwd, max(0.05, 0.5 * remaining))
+        if abs(error_px) > self.centre_tol:
+            # Image x grows to the right; +y is to the left of the base.
+            cmd.linear.y = -math.copysign(
+                min(self.max_lateral, 0.0012 * abs(error_px)), error_px
+            )
+        self.pub_cmd.publish(cmd)
+        self.get_logger().info(
+            f"bin ahead={ahead:.2f} remaining={remaining:+.2f} "
+            f"cmd vx={cmd.linear.x:.3f} vy={cmd.linear.y:+.3f} bearing={error_px:+6.1f}px",
+            throttle_duration_sec=2.0,
         )
 
     def _on_row(self, msg: Int32) -> None:
@@ -805,7 +1008,11 @@ class ApproachNode(Node):
                     f"approach complete — book held for {held:.1f}s at "
                     f"{ahead:.2f} m" if ahead is not None
                     else f"approach complete — book held for {held:.1f}s")
-                self._enter(State.DONE)
+                if self.return_to_bin:
+                    self.get_logger().info("book identified; returning to the bin")
+                    self._enter(State.BIN_SEARCH)
+                else:
+                    self._enter(State.DONE)
             return
 
         # Lost it again: the hold has to restart from zero, not resume.

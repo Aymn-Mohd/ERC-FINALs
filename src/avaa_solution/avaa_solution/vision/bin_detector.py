@@ -9,7 +9,15 @@ yet for the "place in bin" step.
 The bin is the same red as red books (see ``book_detector.py``'s note on this), so this
 gates on both colour and aspect ratio: the bin's bounding box is wide and short
 (``h/w <= MAX_ASPECT_H_OVER_W``), where a book standing on a shelf is narrow and tall.
-Not wired into a node yet -- that is follow-up work, tracked in STATE.md.
+The aspect gate is the real discriminator; area only rejects noise.
+
+MIN_AREA started at 5000 (erc_perception's original value, tuned for a bin filling much
+of the frame at close range) and was too strict for the bin_searching state, which rotates
+in place from several metres away: across more than two full rotations the blob never
+reached that area and the bin was never found. Lowered here to match find_bin_centre_x's
+own threshold -- both functions describe the same blob and had no reason to disagree.
+Still not independently measured against the sim at range; if search keeps missing the
+bin, this is the first number to revisit, with real frames rather than another guess.
 """
 
 from typing import Optional
@@ -22,7 +30,7 @@ RED_UPPER_1 = (10, 255, 255)
 RED_LOWER_2 = (170, 90, 60)
 RED_UPPER_2 = (180, 255, 255)
 
-MIN_AREA = 5000
+MIN_AREA = 200
 MAX_ASPECT_H_OVER_W = 0.85
 
 
@@ -52,7 +60,7 @@ def is_looking_at_bin(
     return (h / float(w)) <= max_aspect_h_over_w
 
 
-def find_bin_centre_x(frame: np.ndarray, min_area: float = 200.0) -> Optional[float]:
+def find_bin_centre_x(frame: np.ndarray, min_area: float = MIN_AREA) -> Optional[float]:
     """Pixel x-coordinate of the largest red blob's centre, for centring the base on it."""
     mask = _red_mask(frame)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
