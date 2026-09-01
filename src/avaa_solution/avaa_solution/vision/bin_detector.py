@@ -12,7 +12,7 @@ gates on both colour and aspect ratio: the bin's bounding box is wide and short
 Not wired into a node yet -- that is follow-up work, tracked in STATE.md.
 """
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -33,9 +33,12 @@ def _red_mask(frame: np.ndarray) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
 
-def is_looking_at_bin(frame: np.ndarray, min_area: float = MIN_AREA,
-                       max_aspect_h_over_w: float = MAX_ASPECT_H_OVER_W) -> bool:
-    """True if the largest red blob in frame is wide-and-short like the collection bin."""
+def is_looking_at_bin(
+    frame: np.ndarray,
+    min_area: float = MIN_AREA,
+    max_aspect_h_over_w: float = MAX_ASPECT_H_OVER_W,
+) -> bool:
+    """Report whether the largest red blob in frame is wide-and-short like the bin."""
     mask = _red_mask(frame)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
