@@ -107,6 +107,11 @@ class PerceptionNode(Node):
         self.last_book_save: Optional[float] = None
         self.reported_column: Optional[int] = None
         self.reported_row: Optional[int] = None
+        # Image x of the target book, last seen while a marker still confirmed its
+        # column. See _track_book_without_marker: without this, close-range tracking
+        # picked whichever same-coloured book sat nearest the frame centre, which could
+        # be a book in the neighbouring column if the robot was even slightly off-axis.
+        self.locked_book_x: Optional[float] = None
         # Confident row readings, voted on before anything is latched. See _publish_row.
         self.row_votes = deque(maxlen=15)
         self.started_at = None
@@ -188,9 +193,13 @@ class PerceptionNode(Node):
         """Keep publishing the target book once the marker is out of frame.
 
         Only valid after the column and row have been established, which is why it does
-        nothing until then. Of the target-coloured books in view, it takes the one nearest
-        the image centre: the robot has already centred and driven in on the target
-        column, so the closest to centre is the one in front of it.
+        nothing until then. Of the target-coloured books in view, it takes the one
+        nearest ``locked_book_x`` -- the target's own last known position, recorded
+        while a marker still confirmed its column -- not the one nearest the image
+        centre. Centre-based selection picked whichever same-coloured book happened to
+        be most centred once the marker left frame, which is the book actually in front
+        of the robot only if the robot is exactly on-axis; a book of the same colour one
+        column over won a run where it was not, and the approach then drove to it.
         """
         if self.reported_row is None or not self.book_colour:
             return
@@ -202,8 +211,22 @@ class PerceptionNode(Node):
             )
             return
 
-        centre = frame.shape[1] / 2.0
-        target = min(candidates, key=lambda b: abs(b.cx - centre))
+        anchor = self.locked_book_x if self.locked_book_x is not None else frame.shape[1] / 2.0
+        target = min(candidates, key=lambda b: abs(b.cx - anchor))
+
+        # A jump this large is not the target drifting between frames, it is a
+        # different book -- e.g. the tracked one left frame and a same-coloured
+        # neighbour is now the nearest match. Better to hold the last good position and
+        # say so than to silently re-anchor onto the wrong column's book.
+        MAX_TRACK_JUMP_PX = 120.0
+        if len(candidates) > 1 and abs(target.cx - anchor) > MAX_TRACK_JUMP_PX:
+            self.get_logger().warn(
+                f"nearest {self.book_colour} book is {abs(target.cx - anchor):.0f}px "
+                f"from the last known position ({len(candidates)} candidates in view); "
+                "holding rather than re-anchoring", throttle_duration_sec=5.0)
+            return
+
+        self.locked_book_x = target.cx
         self.pub_row.publish(Int32(data=self.reported_row))
 
         # Keep feeding a bearing as well as a point. The marker leaves the frame roughly a
@@ -322,9 +345,10 @@ class PerceptionNode(Node):
             return
         frame = self.latest_frame
 
-        # Independent of column/row identification -- the bin only matters once a book
-        # has been found, but the check is cheap and runs every frame regardless, so the
-        # approach controller has a bearing on it as soon as it starts looking.
+        # Independent of column/row identification -- the bin and the start zone only
+        # matter once a book has been found, but the check is cheap and runs every frame
+        # regardless, so the approach controller has a bearing on it as soon as it
+        # starts looking.
         bin_cx = bnd.find_bin_centre_x(frame)
         if bin_cx is not None and bnd.is_looking_at_bin(frame):
             self.pub_bin_x.publish(Float32(data=float(bin_cx)))
@@ -377,6 +401,11 @@ class PerceptionNode(Node):
         # end upright, looking along the shelves rather than at its column.
         target_book = (bd.find_book(columns, column_index, self.book_colour)
                        if self.book_colour else None)
+        if target_book is not None:
+            # Refresh the anchor _track_book_without_marker falls back to once the
+            # marker leaves frame, while it is still coming from the marker-confirmed
+            # column rather than a centre guess.
+            self.locked_book_x = target_book.cx
         steer_x = target_book.cx if target_book is not None else markers[column_index].cx
         self.pub_column_x.publish(Float32(data=float(steer_x)))
         self._save_column_image(frame, books, columns, markers, column_index)
@@ -455,10 +484,19 @@ class PerceptionNode(Node):
         row = self.reported_row
         self.pub_row.publish(Int32(data=row))
 
-        target = bd.find_book(columns, column_index, self.book_colour)
-        if target is not None:
-            self._publish_book_point(target)
-            self._save_book_image(frame, books, target, row)
+        # Same reasoning as the row guard above, applied to which book gets published:
+        # with one marker in view, columns[column_index] came from group_by_anchors'
+        # single-marker fallback (marker apparent size, not measured spacing), which
+        # can sweep in a neighbour's book. approach_node anchors its odom target on
+        # early book_point sightings and then largely disregards later ones that
+        # disagree -- so a wrong book_point here does not just cause one bad frame, it
+        # can lock the whole run onto the wrong book. Publishing nothing on a
+        # single-marker frame is a delay of at most a frame or two, not a fresh guess.
+        if len(markers) >= 2:
+            target = bd.find_book(columns, column_index, self.book_colour)
+            if target is not None:
+                self._publish_book_point(target)
+                self._save_book_image(frame, books, target, row)
 
     # ------------------------------------------------------------------ helpers
 

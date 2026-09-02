@@ -18,8 +18,26 @@ Sequence:
     RETREAT  back off and re-acquire when it is not; twice, then give up
     BIN_SEARCH   (if return_to_bin) turn on the spot until the collection bin is seen
     BIN_CENTRE   rotate until the bin sits in the middle of the image
-    BIN_APPROACH drive in on LiDAR range until the bin is at bin_standoff_m
+    BIN_APPROACH drive in on LiDAR range until the bin is at bin_standoff_m -- not
+                 currently reached from BIN_CENTRE; see its docstring
+    RETURN_TURN  turn in place, from odom, to face back towards the spawn point
+    RETURN_DRIVE drive there, correcting heading from odom as it goes
+    FACE_BIN     turn on the spot until the bin is seen again and centred, then stop
     DONE
+
+RETURN_TURN/RETURN_DRIVE trust /odom, which the rest of this file deliberately does
+not (see the module docstring on the shelf leg, and STATE.md on why -- the mecanum
+wheels have no lateral grip and a push nothing is watching for can slide the base
+indefinitely). What is different here: nothing is commanding the arm or kicking the
+base during this leg, and only x and yaw are ever commanded, never y -- vy is exactly
+the axis with no wheel grip to report against. A vision-based version of this leg was
+tried first (homing on the green start-zone floor marker); it worked but stopped short
+by metres on an unmeasured apparent-size threshold. This one is a port of an earlier,
+working odometry-only version from a prior iteration of this project (see
+https://github.com/abubakrhpc/ERC/blob/main/erc_go_return/go_and_return_node.py),
+brought back in because it is simpler and was already shown to work, not because the
+odom concerns on the rest of this file no longer apply -- if the base is ever kicked
+during this leg the same drift risk is live.
 
 Lateral motion is commanded, and turning is not, once the arms are tucked. Rotating to
 chase a bearing while driving turns a small angular error into a large lateral excursion --
@@ -44,6 +62,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PointStamped, Twist
+from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
@@ -86,9 +105,9 @@ TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
 TOPIC_BIN_X = "/avaa/perception/bin_x"
+TOPIC_ODOM = "/odom"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
 TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
-TOPIC_TORSO = "/torso_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
 TOPIC_STATE = "/avaa/approach/state"
 TOPIC_CMD = "/cmd_vel"
@@ -114,42 +133,22 @@ SENSOR_QOS = QoSProfile(
 # This pose measured 0.319 m forward and 0.174 m lateral, both inside the base footprint
 # (0.36 m half-length, 0.249 m half-width), with no contacts. Joint 2 does most of the
 # work; the elbow pulls the forearm in laterally, and joint 1 finishes the job.
-# Folded, and collision free -- which the previous tuck was not.
 #
-# [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0] puts arm_left_2 through arm_left_5 against
-# torso_base_link and torso_lift_link. Gazebo never objected, because self-collision
-# is not checked there, so it went unnoticed for the whole project until MoveIt
-# refused to plan from it: the start state was invalid and every request came back
-# 'Motion planning start tree could not be initialized'.
-#
-# This one was found by sampling folded postures and asking /check_state_validity,
-# keeping the most compact one with at least 0.15 rad of room at every joint stop.
-# It is also tighter than the old one: the gripper sits 0.29 m from the base axis
-# rather than 0.49 m.
-TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
-# The tuck is an eight-joint posture, torso included, and only the eight together
-# are collision free. Commanding the arm alone and leaving the torso down folds
-# arm_left_5, arm_left_6 and the gripper into base_link -- MoveIt reports exactly
-# those three contacts -- and the planner then refuses every request from that
-# start state, in 0.4 s, with no indication that the torso is the reason.
-TUCK_TORSO = 0.15
+# NOTE: this posture puts arm_left_2 through arm_left_5 in self-collision against
+# torso_base_link and torso_lift_link (found later when MoveIt was added for grasping;
+# Gazebo does not check self-collision, so it never mattered for driving). Left as the
+# original measured value for now -- revisit if/when arm work resumes.
+TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
 
-# The right arm is never used, but it still has to be out of the way, and mirroring
-# the left tuck by flipping two joints does not do that: it leaves arm_right_4_link
-# at x=0.491, which is inside the shelf once the base is close enough to grasp from.
-# MoveIt then reports the robot in collision and refuses every left-arm goal, so the
-# grasp fails for a reason that has nothing to do with the arm doing the work.
-#
-# Found the same way as the left tuck, by sampling against /check_state_validity with
-# the shelf in the scene at grasping distance. See tools/find_right_tuck.py.
-#
-# Scored on where the links actually end up, not on how small the joint angles are.
-# Scoring on the angles picks postures close to all-zeros, and all-zeros is the arm
-# stretched straight out: the first answer put the right gripper 0.88 m forward,
-# inside the shelf, against shelf_back. This one reaches 0.204 m forward and is
-# checked at both torso heights, because raising the torso for the top rows takes
-# the whole upper body with it.
-RIGHT_TUCK = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
+
+def wrap_angle(a: float) -> float:
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def yaw_from_quat(q) -> float:
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 class State(Enum):
@@ -165,6 +164,9 @@ class State(Enum):
     BIN_SEARCH = "bin_searching"
     BIN_CENTRE = "bin_centring"
     BIN_APPROACH = "bin_approaching"
+    RETURN_TURN = "return_turning"
+    RETURN_DRIVE = "return_driving"
+    FACE_BIN = "facing_bin"
     DONE = "done"
     FAILED = "failed"
 
@@ -214,6 +216,18 @@ class ApproachNode(Node):
         self.declare_parameter("return_to_bin", True)
         self.declare_parameter("bin_standoff_m", 0.70)
         self.declare_parameter("bin_standoff_tolerance_m", 0.05)
+        # Return leg: from odom, not vision -- see the module docstring. Ported values
+        # from the earlier working version rather than this file's own conventions.
+        self.declare_parameter("arrive_tolerance_m", 0.08)
+        self.declare_parameter("return_yaw_tolerance_rad", 0.06)
+        # How long the bin has to sit centred before FACE_BIN calls it done, so a
+        # single frame where the head is still settling can't end the run early --
+        # same reasoning as VERIFY's book_hold_time on the shelf leg.
+        self.declare_parameter("bin_face_dwell_sec", 0.5)
+        # Wider than centre_tolerance_px on purpose: the start zone is close enough to
+        # the bin that the shelf leg's tight tolerance is harder to hold than it needs
+        # to be for just facing the bin, not reaching into it.
+        self.declare_parameter("bin_face_centre_tolerance_px", 30.0)
 
         self.standoff = float(self.get_parameter("standoff_m").value)
         self.centre_tol = float(self.get_parameter("centre_tolerance_px").value)
@@ -231,12 +245,20 @@ class ApproachNode(Node):
         self.return_to_bin = bool(self.get_parameter("return_to_bin").value)
         self.bin_standoff = float(self.get_parameter("bin_standoff_m").value)
         self.bin_standoff_tol = float(self.get_parameter("bin_standoff_tolerance_m").value)
+        self.arrive_tol = float(self.get_parameter("arrive_tolerance_m").value)
+        self.return_yaw_tol = float(self.get_parameter("return_yaw_tolerance_rad").value)
+        self.bin_face_dwell = float(self.get_parameter("bin_face_dwell_sec").value)
+        self.bin_face_centre_tol = float(
+            self.get_parameter("bin_face_centre_tolerance_px").value)
 
         self.column_cx: Optional[float] = None
         self.column_cx_at: Optional[float] = None
         self.bin_cx: Optional[float] = None
         self.bin_cx_at: Optional[float] = None
         self.bin_head_levelled = False
+        self.odom_pose: Optional[Tuple[float, float, float]] = None
+        self.face_bin_head_levelled = False
+        self.bin_centred_since: Optional[float] = None
         self.scan: Optional[LaserScan] = None
         self.state = State.WAITING
         self.state_since = self._now()
@@ -312,6 +334,7 @@ class ApproachNode(Node):
         self.create_subscription(
             PointStamped, TOPIC_BOOK_POINT, self._on_book_point, 10)
         self.create_subscription(Float32, TOPIC_BIN_X, self._on_bin_x, 10)
+        self.create_subscription(Odometry, TOPIC_ODOM, self._on_odom, 10)
         self.row_heights = list(
             self.get_parameter("row_heights").value or DEFAULT_ROW_HEIGHTS)
         self.pub_head = self.create_publisher(
@@ -323,7 +346,6 @@ class ApproachNode(Node):
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
         self.pub_arm_left = self.create_publisher(JointTrajectory, TOPIC_ARM_LEFT, 10)
         self.pub_arm_right = self.create_publisher(JointTrajectory, TOPIC_ARM_RIGHT, 10)
-        self.pub_torso = self.create_publisher(JointTrajectory, TOPIC_TORSO, 10)
 
         self.create_timer(0.1, self._tick)
         self.get_logger().info(
@@ -363,6 +385,11 @@ class ApproachNode(Node):
         if (self._now() - self.bin_cx_at) > max_age:
             return None
         return self.bin_cx
+
+    def _on_odom(self, msg: Odometry) -> None:
+        p = msg.pose.pose.position
+        yaw = yaw_from_quat(msg.pose.pose.orientation)
+        self.odom_pose = (p.x, p.y, yaw)
 
     def _on_joints(self, msg: JointState) -> None:
         for name, position in zip(msg.name, msg.position):
@@ -499,6 +526,9 @@ class ApproachNode(Node):
             self.tuck_sent_at = None
         if state is State.BIN_SEARCH:
             self.bin_head_levelled = False
+        if state is State.FACE_BIN:
+            self.face_bin_head_levelled = False
+            self.bin_centred_since = None
         if state is not self.state:
             self.get_logger().info(f"{self.state.value} -> {state.value}")
             self.state = state
@@ -534,8 +564,13 @@ class ApproachNode(Node):
         # the bin. BIN_APPROACH gets the same long budget too: the bin sits roughly
         # 6 m from where the shelf leg ends, several times the shelf APPROACH's own
         # distances that state_timeout_sec was sized for.
+        # RETURN_TURN/RETURN_DRIVE are not in this budget: each re-entry resets
+        # state_since (see _enter), and RETURN_DRIVE re-enters RETURN_TURN itself
+        # whenever the heading drifts too far, so the default state_timeout_sec only
+        # has to cover one leg of the zig-zag rather than the whole trip home.
         budget = (self.search_timeout
-                  if self.state in (State.SEARCH, State.BIN_SEARCH, State.BIN_APPROACH)
+                  if self.state in (State.SEARCH, State.BIN_SEARCH, State.BIN_APPROACH,
+                                    State.FACE_BIN)
                   else self.timeout)
         if self._elapsed() > budget:
             self.get_logger().error(f"timed out in {self.state.value}")
@@ -543,7 +578,9 @@ class ApproachNode(Node):
             self._enter(State.FAILED)
             return
 
-        # Safety floor applies in every moving state.
+        # Safety floor applies in every moving state. Not RETURN_DRIVE: that state
+        # checks range itself and holds rather than aborting, since ending the run on
+        # a spurious close reading on the way home is worse than waiting a tick.
         nearest = self._min_range_ahead()
         if (nearest is not None and nearest < self.min_safe
                 and self.state in (State.APPROACH, State.BIN_APPROACH)):
@@ -578,6 +615,12 @@ class ApproachNode(Node):
             self._do_bin_centre()
         elif self.state is State.BIN_APPROACH:
             self._do_bin_approach()
+        elif self.state is State.RETURN_TURN:
+            self._do_return_turn()
+        elif self.state is State.RETURN_DRIVE:
+            self._do_return_drive()
+        elif self.state is State.FACE_BIN:
+            self._do_face_bin()
 
     def _send(self, pub, names: List[str], values: List[float], seconds: float) -> bool:
         """Publish a single-point JointTrajectory, but only if something is listening.
@@ -607,19 +650,25 @@ class ApproachNode(Node):
         pub.publish(traj)
         return True
 
-    def _send_tuck(self) -> bool:
-        """Command both arms and the torso to the driving posture.
+    @staticmethod
+    def _mirrored_tuck() -> List[float]:
+        """Right arm mirrors the left tuck: flip the shoulder pan and upper-arm roll."""
+        pose = list(TUCK_POSE)
+        pose[0] = -pose[0]
+        pose[2] = -pose[2]
+        return pose
 
-        Only once something is listening on every one of the three controllers.
-        Returns whether all three commands actually went out this call.
+    def _send_tuck(self) -> bool:
+        """Command both arms to the driving posture.
+
+        Only once something is listening on both controllers. Returns whether both
+        commands actually went out this call.
         """
         ok = True
         for pub, side in ((self.pub_arm_left, "left"), (self.pub_arm_right, "right")):
             names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
-            pose = RIGHT_TUCK if side == "right" else TUCK_POSE
+            pose = self._mirrored_tuck() if side == "right" else TUCK_POSE
             ok = self._send(pub, names, pose, self.tuck_time) and ok
-        ok = self._send(
-            self.pub_torso, ["torso_lift_joint"], [TUCK_TORSO], self.tuck_time) and ok
         if ok:
             self.get_logger().info("stowing arms for driving")
         return ok
@@ -630,9 +679,8 @@ class ApproachNode(Node):
         Returns None until every joint the tuck touches has reported at least once.
         """
         names = ([f"arm_left_{i}_joint" for i in range(1, 8)]
-                 + [f"arm_right_{i}_joint" for i in range(1, 8)]
-                 + ["torso_lift_joint"])
-        targets = list(TUCK_POSE) + list(RIGHT_TUCK) + [TUCK_TORSO]
+                 + [f"arm_right_{i}_joint" for i in range(1, 8)])
+        targets = list(TUCK_POSE) + self._mirrored_tuck()
         try:
             actual = [self.joints[name] for name in names]
         except KeyError:
@@ -679,7 +727,10 @@ class ApproachNode(Node):
             return
 
         cmd = Twist()
-        cmd.angular.z = self.search_rate
+        # Clockwise (negative z, right-hand rule about the up axis) by preference --
+        # no measured reason to prefer either direction, but a fixed choice matters
+        # more than which one for a repeatable search sweep.
+        cmd.angular.z = -self.search_rate
         self.pub_cmd.publish(cmd)
         self.get_logger().info(
             f"searching for marker... ({self._elapsed():.0f}s)",
@@ -723,7 +774,14 @@ class ApproachNode(Node):
         error_px = bin_cx - self.image_width / 2.0
         if abs(error_px) <= self.centre_tol:
             self._stop()
-            self._enter(State.BIN_APPROACH)
+            # Not BIN_APPROACH: the bin sits on erc_table, and driving in on LiDAR
+            # range collided with the table on a live run without ever stopping. The
+            # table's collision mesh is legs-and-top rather than a flat face at LiDAR
+            # height, so _range_ahead's forward cone can see clean through it -- a
+            # blind spot, not a tuning problem, and there is nothing to place in the
+            # bin yet anyway. Seeing and centring on it is enough for this phase; go
+            # straight to heading home instead of closing the distance.
+            self._enter(State.RETURN_TURN)
             return
         cmd = Twist()
         cmd.angular.z = -math.copysign(
@@ -733,6 +791,11 @@ class ApproachNode(Node):
 
     def _do_bin_approach(self) -> None:
         """Drive in on LiDAR range until the bin is at bin_standoff_m.
+
+        Not currently reached -- see _do_bin_centre. Kept for the future placement
+        phase, once the table's LiDAR blind spot has its own fix (a closer safety
+        cone, a different sensor, or a measured standoff that stops short of where
+        the table's mesh actually is).
 
         Correcting sideways, not by turning -- measured live: turning to chase the
         bearing while driving forward let the error run away from -10px to +170px over
@@ -777,6 +840,115 @@ class ApproachNode(Node):
             f"cmd vx={cmd.linear.x:.3f} vy={cmd.linear.y:+.3f} bearing={error_px:+6.1f}px",
             throttle_duration_sec=2.0,
         )
+
+    def _do_return_turn(self) -> None:
+        """Turn in place, from odom, to face the spawn point.
+
+        Ported from the earlier working version -- see the module docstring. odom_pose
+        is (x, y, yaw) straight from /odom; the spawn point is its origin, since the
+        start zone sits at the world origin and odom zeroes there at boot.
+        """
+        if self.odom_pose is None:
+            self._stop()
+            return
+        x, y, yaw = self.odom_pose
+        target_yaw = math.atan2(-y, -x)
+        err = wrap_angle(target_yaw - yaw)
+        if abs(err) <= self.return_yaw_tol:
+            self._stop()
+            self._enter(State.RETURN_DRIVE)
+            return
+        cmd = Twist()
+        cmd.angular.z = math.copysign(min(0.3, 0.8 * abs(err) + 0.05), err)
+        self.pub_cmd.publish(cmd)
+
+    def _do_return_drive(self) -> None:
+        """Drive towards the spawn point, from odom, re-turning if the heading drifts.
+
+        Ported from the earlier working version -- see the module docstring. Holds
+        rather than aborting the run on a close LiDAR reading: unlike the shelf or bin
+        legs there is nothing here worth ending the run over, most likely a person or
+        object that has since moved, and RETURN_TURN already reacts if it turns out to
+        be the shelf or bin encroaching on the path home.
+        """
+        if self.odom_pose is None:
+            self._stop()
+            return
+        x, y, yaw = self.odom_pose
+        dist = math.hypot(x, y)
+        if dist <= self.arrive_tol:
+            self._stop()
+            self.get_logger().info("back at the start zone")
+            self._enter(State.FACE_BIN)
+            return
+        target_yaw = math.atan2(-y, -x)
+        err = wrap_angle(target_yaw - yaw)
+        nearest = self._min_range_ahead()
+        if nearest is not None and nearest < self.min_safe:
+            self._stop()
+            self.get_logger().warn(
+                f"obstacle at {nearest:.2f} m while returning; holding",
+                throttle_duration_sec=3.0)
+            return
+        if abs(err) > 0.15:
+            self._enter(State.RETURN_TURN)
+            return
+        cmd = Twist()
+        cmd.linear.x = min(self.max_fwd, max(0.05, 0.5 * dist))
+        cmd.angular.z = math.copysign(min(0.2, 0.6 * abs(err)), err)
+        self.pub_cmd.publish(cmd)
+        self.get_logger().info(f"returning, dist={dist:.2f} m", throttle_duration_sec=2.0)
+
+    def _do_face_bin(self) -> None:
+        """Rotate on the spot until the bin is seen and centred again, then stop.
+
+        The heading picked up while homing on the spawn point is whatever RETURN_TURN
+        last settled on, not necessarily facing the bin, so this re-finds it visually
+        rather than trusting the yaw held since BIN_CENTRE. Same idiom as
+        _do_bin_search / _do_bin_centre. Requires the bin held centred for
+        bin_face_dwell_sec rather than one instant reading, the same guard VERIFY uses
+        on the shelf leg -- a single frame while the head is still settling would
+        otherwise end the run facing slightly off.
+        """
+        if not self.face_bin_head_levelled:
+            self.face_bin_head_levelled = self._send(
+                self.pub_head, ["head_1_joint", "head_2_joint"], [0.0, 0.0], 1.0)
+
+        bin_cx = self._bin_cx_fresh()
+        if bin_cx is None:
+            self.bin_centred_since = None
+            cmd = Twist()
+            cmd.angular.z = self.search_rate
+            self.pub_cmd.publish(cmd)
+            self.get_logger().info(
+                f"searching for the bin to face it... ({self._elapsed():.0f}s)",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        error_px = bin_cx - self.image_width / 2.0
+        if abs(error_px) <= self.bin_face_centre_tol:
+            self._stop()
+            now = self._now()
+            if self.bin_centred_since is None:
+                self.bin_centred_since = now
+            elif now - self.bin_centred_since >= self.bin_face_dwell:
+                self.get_logger().info("back at the start zone, facing the bin — done")
+                self._enter(State.DONE)
+            return
+        self.bin_centred_since = None
+        cmd = Twist()
+        # No +0.08 floor here, unlike _do_bin_centre's identical-looking formula: that
+        # floor is fine when the bin is metres away and a given yaw rate moves it only
+        # a few px, but the start zone sits about a metre from the bin (erc_world.sdf),
+        # close enough that 0.08 rad/s alone swings bin_cx well past the tolerance
+        # band in one 0.1 s tick. It never settled, oscillating either side of centre.
+        # Pure proportional instead, so the commanded rate actually goes to zero near
+        # zero error. Gains and bin_face_centre_tolerance_px are first attempts.
+        cmd.angular.z = -math.copysign(
+            min(self.max_yaw, 0.0025 * abs(error_px)), error_px
+        )
+        self.pub_cmd.publish(cmd)
 
     def _on_row(self, msg: Int32) -> None:
         self.row_seen = True
