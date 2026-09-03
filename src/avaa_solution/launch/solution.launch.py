@@ -17,8 +17,12 @@ Nodes are kept separate rather than combined into one process: the Phase 1 rubri
 modularity explicitly, and it means perception can be run and debugged on its own.
 """
 
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -72,6 +76,17 @@ def generate_launch_description() -> LaunchDescription:
     # silently gets nothing.
     sim_time = {"use_sim_time": True}
 
+    moveit = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(
+                get_package_share_directory("avaa_solution"),
+                "launch",
+                "moveit.launch.py",
+            )
+        ),
+        launch_arguments={"use_sim_time": "true"}.items(),
+    )
+
     perception = Node(
         package="avaa_solution",
         executable="perception",
@@ -85,10 +100,21 @@ def generate_launch_description() -> LaunchDescription:
         }],
     )
 
+    # return_to_bin must be false while grasping: after VERIFY the approach would
+    # otherwise drive to the bin and take the book point with it, leaving grasp in IDLE.
     approach = Node(
         package="avaa_solution",
         executable="approach",
         name="avaa_approach",
+        output="screen",
+        emulate_tty=True,
+        parameters=[sim_time, {"return_to_bin": False}],
+    )
+
+    grasp = Node(
+        package="avaa_solution",
+        executable="grasp",
+        name="avaa_grasp",
         output="screen",
         emulate_tty=True,
         parameters=[sim_time],
@@ -114,7 +140,9 @@ def generate_launch_description() -> LaunchDescription:
             "[AVAA] target column marker=", shelf_column_number,
             "  book colour=", book_colour,
         ]),
+        moveit,
         perception,
         approach,
+        grasp,
         mission,
     ])

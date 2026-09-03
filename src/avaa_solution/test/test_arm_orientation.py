@@ -8,12 +8,17 @@ the corner of the book without touching it.
 """
 
 import math
+import os
 
 import numpy as np
 
 import pytest
 
-from avaa_solution.kinematics.arm_chain import ArmChain, _angle_between
+from avaa_solution.kinematics.arm_chain import DEFAULT_URDF, ArmChain, _angle_between
+
+pytestmark = pytest.mark.skipif(
+    not os.path.exists(DEFAULT_URDF), reason="robot URDF not present"
+)
 
 APPROACH = [1.0, 0.0, 0.0]
 CLOSING = [0.0, 1.0, 0.0]

@@ -39,65 +39,64 @@ anything, because most non-obvious decisions have a measurement behind them.
 | Nav2 gross navigation | ✅ works to ~0.35 m tolerance |
 | Fine approach controller | ⚠️ **works sometimes** — not reliable |
 | Arm kinematics + IK | ✅ exact to 0.7 mm; all four rows reachable |
-| Grasp controller | ⚠️ **written and unit-tested, never run end to end** |
+| Grasp controller | ✅ **restored** into the tree and launch; offline geometry/IK tests green; live pick still to prove |
 | Place in bin | ❌ not started |
 | Video (D2) | ❌ not started |
 | Report (D3) | ❌ not started |
 
-**80 unit tests**, no simulator required:
+Grasp was stripped on 2026-09-03 (`3e2e8cc`) for a movement-only phase and restored from
+`3e2e8cc^`. `solution.launch.py` now starts `move_group`, perception, approach
+(`return_to_bin:=false` so VERIFY hands off instead of driving to the bin), grasp, and
+mission.
+
+**Unit tests** (grasp geometry + arm chain + orientation). In the container:
 
 ```bash
 sim shell
-cd /opt/erc_ws/src/avaa_solution && python3 -m pytest test/ -q
+cd /opt/erc_ws/src/avaa_solution && python3 -m pytest \
+    test/test_grasp_geometry.py test/test_arm_chain.py test/test_arm_orientation.py -q
 ```
 
 ---
 
 ## The next step
 
-**Get one clean end-to-end pick.** Everything upstream is measured; what has never happened
-is the whole chain running through in a single trial.
+**Prove one clean pick at a healthy real-time factor**, then trust the full trial.
 
-### Exactly where it stops (as of 2026-08-27)
+### 1. Isolated pick (skip flaky approach) — do this first
 
-The approach now works: it tucks the arms, searches for the marker from the spawn pose,
-centres, drives in to 0.80 m, and squares up to within about 2 degrees. That part is
-repeatable.
-
-What fails is the last step before grasping — **the target book is not reliably in frame at
-grasping range**, so the book point is never published and the grasp controller sits in
-IDLE waiting for a target it never gets.
-
-Two things are in tension, and this is the crux:
-
-- **The camera must see the book** to locate it, which wants distance and a level head.
-- **The arm must reach the book**, which wants closeness — the reachability map loses a
-  corner of the envelope beyond 0.85 m.
-
-Tilting the head down keeps the books in frame but pushes the *markers* out, which is what
-the robot had been steering by. Steering now switches to the book itself once it is seen,
-but the handover is not yet reliable: if the robot drifts before the book is acquired, it
-can arrive at the shelf's end upright with nothing recognisable in view.
-
-Ideas not yet tried, roughly in order of promise:
-
-1. **Acquire the book before closing in.** Stop at ~1.5 m, tilt the head, confirm the book
-   is seen and centred, and only then drive the final stretch. Turns a handover mid-drive
-   into a checkpoint.
-2. **Use the depth point rather than the image bearing for the final metre.** The book's
-   3D position is already published and is good to 15-35 mm in x and y; driving to a pose
-   relative to that is stronger than centring pixels.
-3. **Head pan.** `head_1_joint` has +/-75 degrees and is unused. The robot could keep the
-   book in view while the base is not perfectly aligned.
+Same idea as ROSALYA / TIAGo Pro mobile manipulation: get the base in front of the object,
+then let the arm + MoveIt do the pick. `tools/ideal_grasp.py` feeds Gazebo ground-truth
+book pose into the real grasp controller so mechanics are tested without perception.
 
 ```bash
 sim start --fast --headless
-# then, in the container, with use_sim_time on every node:
-ros2 run avaa_solution perception --ros-args -p use_sim_time:=true \
-    -p shelf_column_number:=3 -p book_colour:=blue
-ros2 run avaa_solution approach --ros-args -p use_sim_time:=true
-ros2 run avaa_solution grasp    --ros-args -p use_sim_time:=true
+# confirm RTF is usable before believing any result
+#   docker exec erc_sim gz topic -e -t /stats
+tools/simready.sh                  # Gazebo models + depth + move_group
+# park the base in front of a shelf column (existing place_robot / approach), then:
+tools/in-sim ideal_grasp.py red
 ```
+
+Success: book leaves the shelf; `/avaa/grasp/state` reaches `done`; RTF stays well above
+the ~0.03 GUI death zone.
+
+### 2. Full perception → approach → grasp
+
+```bash
+sim start --fast --headless
+tools/simready.sh
+# organisers' entry point already includes move_group + grasp:
+ros2 launch avaa_solution solution.launch.py \
+    shelf_column_number:=3 book_colour:=blue
+```
+
+### Approach still flaky at grasping range
+
+What still fails on real perception: **the target book is not always in frame at grasping
+range**, so the book point is never published and grasp sits in IDLE. Acquire-at-1.5 m,
+depth-point final metre, and head pan remain the next approach fixes — only after an
+ideal pick works.
 
 Two or three clean picks before trusting it. After that: placing in the bin (+2 dropped,
 **+4 gently placed** — the largest single scoring item in the task), then the video and

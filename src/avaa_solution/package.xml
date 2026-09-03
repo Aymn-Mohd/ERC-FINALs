@@ -5,10 +5,8 @@
   <version>0.1.0</version>
   <description>
     Team AVAA solution for the Emirates Robotics Competition 2026 (Phase 1).
-    Autonomously locates a book by shelf column marker and colour, and drives to the
-    collection bin, using TIAGo Pro in Gazebo Harmonic. Grasping is out of scope for
-    now (see git history for the earlier grasp_node work); this phase covers movement
-    and identification only.
+    Autonomously locates a book by shelf column marker and colour, grasps it, and
+    delivers it to the collection bin using TIAGo Pro in Gazebo Harmonic.
   </description>
   <maintainer email="psych.rest@gmail.com">Team AVAA</maintainer>
   <license>Apache-2.0</license>

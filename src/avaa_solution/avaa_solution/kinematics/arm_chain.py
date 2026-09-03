@@ -19,13 +19,21 @@ No ROS dependency, so it is unit-testable without a simulator.
 from __future__ import annotations
 
 import math
+import os
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import numpy as np
 
-DEFAULT_URDF = "/opt/erc_ws/src/erc_description/urdf/tiago_pro.urdf"
+# Prefer the path inside the competition image; fall back to the vendored copy in this
+# repo so kinematics unit tests can run on a host that is not the Docker workspace.
+_IMAGE_URDF = "/opt/erc_ws/src/erc_description/urdf/tiago_pro.urdf"
+_REPO_URDF = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "..",
+    "erc_description", "urdf", "tiago_pro.urdf",
+))
+DEFAULT_URDF = _IMAGE_URDF if os.path.exists(_IMAGE_URDF) else _REPO_URDF
 ROOT_LINK = "base_link"
 TIP_LINK = "gripper_left_grasping_link"
 
