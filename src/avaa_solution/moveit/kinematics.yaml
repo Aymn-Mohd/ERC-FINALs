@@ -1,0 +1,14 @@
+# KDL rather than a closed-form solver: the arm group includes the prismatic torso
+# lift, which no analytic solver for this arm covers, and the eight-joint chain is
+# exactly the one avaa_solution/kinematics/arm_chain.py already models. Keeping the two
+# in agreement matters -- the fallback path still uses the analytic version.
+arm_left_torso:
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  kinematics_solver_search_resolution: 0.005
+  kinematics_solver_timeout: 0.05
+  kinematics_solver_attempts: 3
+arm_left:
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  kinematics_solver_search_resolution: 0.005
+  kinematics_solver_timeout: 0.05
+  kinematics_solver_attempts: 3

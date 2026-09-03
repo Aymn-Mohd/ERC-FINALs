@@ -1,0 +1,54 @@
+# Velocities come from the URDF. Accelerations are not in the URDF and are set here
+# deliberately low: this arm takes roughly three times the trajectory duration it is
+# given, and a joint_trajectory_controller aborts a trajectory it cannot keep up with,
+# which looks exactly like a command that was never sent -- the arm does not move and
+# nothing says why. Two runs were lost to that before it was understood.
+default_velocity_scaling_factor: 0.5
+default_acceleration_scaling_factor: 0.5
+
+joint_limits:
+  torso_lift_joint:
+    has_velocity_limits: true
+    max_velocity: 0.0350
+    has_acceleration_limits: true
+    max_acceleration: 0.5000
+  arm_left_1_joint:
+    has_velocity_limits: true
+    max_velocity: 0.6000
+    has_acceleration_limits: true
+    max_acceleration: 0.5000
+  arm_left_2_joint:
+    has_velocity_limits: true
+    max_velocity: 0.6000
+    has_acceleration_limits: true
+    max_acceleration: 0.5000
+  arm_left_3_joint:
+    has_velocity_limits: true
+    max_velocity: 0.6000
+    has_acceleration_limits: true
+    max_acceleration: 0.5000
+  arm_left_4_joint:
+    has_velocity_limits: true
+    max_velocity: 0.6000
+    has_acceleration_limits: true
+    max_acceleration: 0.5000
+  arm_left_5_joint:
+    has_velocity_limits: true
+    max_velocity: 0.6000
+    has_acceleration_limits: true
+    max_acceleration: 0.5000
+  arm_left_6_joint:
+    has_velocity_limits: true
+    max_velocity: 0.6000
+    has_acceleration_limits: true
+    max_acceleration: 0.5000
+  arm_left_7_joint:
+    has_velocity_limits: true
+    max_velocity: 0.6000
+    has_acceleration_limits: true
+    max_acceleration: 0.5000
+  gripper_left_finger_joint:
+    has_velocity_limits: true
+    max_velocity: 2.0000
+    has_acceleration_limits: true
+    max_acceleration: 1.0000
