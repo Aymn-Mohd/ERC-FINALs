@@ -63,6 +63,7 @@ TOPIC_STATE = "/avaa/grasp/state"
 GRIPPER_TOPIC = "/gripper_left_controller_raw/joint_trajectory"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
 TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
+TOPIC_TORSO = "/torso_controller/joint_trajectory"
 
 ARM_JOINTS = [f"arm_left_{i}_joint" for i in range(1, 8)]
 CHAIN_JOINTS = ["torso_lift_joint"] + ARM_JOINTS
@@ -150,11 +151,12 @@ DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 # 0.49 m.
 TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
 TUCK_TORSO = 0.15
-# Right arm: flip shoulder pan and upper-arm roll (same mapping as approach_node).
-RIGHT_TUCK_POSE = [
-    -TUCK_POSE[0], TUCK_POSE[1], -TUCK_POSE[2],
-    TUCK_POSE[3], TUCK_POSE[4], TUCK_POSE[5], TUCK_POSE[6],
-]
+# Not a mirror of the left tuck. Flipping joints 0 and 2 puts
+# gripper_right_base_finger_right_link through base_link -- MoveIt then refuses every
+# left-arm plan with "start tree could not be initialized" while /check_state_validity
+# for arm_left_torso still passes (it does not care about the idle arm). Measured via
+# tools/find_right_tuck.py; same values as tools/tuck_arm.py.
+RIGHT_TUCK_POSE = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
 RIGHT_ARM_JOINTS = [f"arm_right_{i}_joint" for i in range(1, 8)]
 
 # The wrist, in base_link: reach along +x, close the fingers across y. Both come from the
@@ -392,6 +394,8 @@ class GraspNode(Node):
         # with Gazebo's own query service.
         self.book_fresh = 6.0
         self.pre_solution = None
+        self.raised = None
+        self.raise_deadline = None
 
         self.motion_thread: Optional[threading.Thread] = None
         self.motion_result = None
@@ -413,6 +417,7 @@ class GraspNode(Node):
             JointTrajectory, TOPIC_ARM_LEFT, 10)
         self.pub_arm_right = self.create_publisher(
             JointTrajectory, TOPIC_ARM_RIGHT, 10)
+        self.pub_torso = self.create_publisher(JointTrajectory, TOPIC_TORSO, 10)
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
         self.safe_tuck_sent = False
         self.safe_tuck_deadline = None
@@ -500,30 +505,43 @@ class GraspNode(Node):
         traj.points = [point]
         pub.publish(traj)
 
+    def _send_torso(self, height: float, seconds: float = 12.0) -> None:
+        traj = JointTrajectory()
+        traj.joint_names = ["torso_lift_joint"]
+        point = JointTrajectoryPoint()
+        point.positions = [float(height)]
+        point.time_from_start = Duration(
+            sec=int(seconds), nanosec=int((seconds % 1.0) * 1e9))
+        traj.points = [point]
+        self.pub_torso.publish(traj)
+
     def _arms_clear_for_planning(self) -> bool:
         """Hold SCENE until both arms use the MoveIt-valid tuck.
 
-        Approach used to leave both arms in a Gazebo-only tuck that self-collides in
-        MoveIt. Every pre-grasp candidate then failed as 'in collision', and RAISE's
-        start state was invalid for the same reason. Command the collision-free fold
-        directly (controllers, not MoveIt) so the planner can start from a legal state.
+        Always re-command once: approach may have arrived at a pose whose joint-space
+        gap looks small but still puts the idle right gripper through base_link (the
+        mirrored left tuck). Controllers, not MoveIt -- MoveIt cannot plan away from an
+        invalid start.
         """
-        left = self._left_tuck_gap()
-        right = self._right_tuck_gap()
-        if (left is not None and left <= 0.5
-                and right is not None and right <= 0.5):
-            return True
         if not self.safe_tuck_sent:
+            self._send_torso(TUCK_TORSO)
             self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
             self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
             self.safe_tuck_sent = True
             self.safe_tuck_deadline = self.get_clock().now() + Duration(sec=20)
+            left = self._left_tuck_gap()
+            right = self._right_tuck_gap()
             self.get_logger().info(
                 "folding both arms to the collision-free tuck before planning"
                 " (left %.1f rad, right %.1f rad from target)"
                 % (left if left is not None else -1.0,
                    right if right is not None else -1.0))
             return False
+        left = self._left_tuck_gap()
+        right = self._right_tuck_gap()
+        if (left is not None and left <= 0.5
+                and right is not None and right <= 0.5):
+            return True
         if (self.safe_tuck_deadline is not None
                 and self.get_clock().now() >= self.safe_tuck_deadline):
             self.get_logger().warn(
@@ -1235,19 +1253,35 @@ class GraspNode(Node):
         # the arm then unfolds at the height it will work at.
         ideal = self._torso_for(float(self.pre_target[2]))["torso_lift_joint"][0]
         self.raised = [ideal] + list(TUCK_POSE)
+        # Controllers, not MoveIt: RAISE is a known fold + torso height, and MoveIt
+        # refuses to start if the idle right arm is still settling into its tuck.
+        self.raise_deadline = self.get_clock().now() + Duration(sec=25)
+        self._send_torso(ideal, seconds=15.0)
+        self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
+        self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
+        self.get_logger().info(
+            "raising torso to %.2f m with arms folded (joint trajectories)" % ideal)
         self._enter(State.RAISE)
-        self._start("raise", lambda: self.moveit.move_to_joints(
-            CHAIN_JOINTS, self.raised, timeout=180.0))
 
     def _do_raise(self) -> None:
-        done = self._finished()
-        if done is None:
+        ideal = float(self.raised[0]) if self.raised else TUCK_TORSO
+        torso = self.joints.get("torso_lift_joint")
+        left = self._left_tuck_gap()
+        right = self._right_tuck_gap()
+        torso_ok = torso is not None and abs(float(torso) - ideal) <= 0.04
+        arms_ok = (left is not None and left <= 0.5
+                   and right is not None and right <= 0.5)
+        timed_out = (self.raise_deadline is not None
+                     and self.get_clock().now() >= self.raise_deadline)
+        if not ((torso_ok and arms_ok) or timed_out):
             return
-        code, _ = done
-        if code != 1:
+        if timed_out and not (torso_ok and arms_ok):
             self.get_logger().warn(
-                "could not raise the torso first (%s); reaching from where we are"
-                % error_name(code))
+                "raise not fully confirmed (torso %s, left %.1f, right %.1f); "
+                "reaching from where we are"
+                % ("ok" if torso_ok else "short",
+                   left if left is not None else -1.0,
+                   right if right is not None else -1.0))
         else:
             self.get_logger().info(
                 "torso at the row, arm still folded; reaching out")

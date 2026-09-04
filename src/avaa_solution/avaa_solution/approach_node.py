@@ -130,12 +130,12 @@ SENSOR_QOS = QoSProfile(
 # while the LiDAR still read 0.94 m of clear space ahead. Each contact event costs half a
 # point.
 #
-# Same collision-free fold as grasp_node / tools/tuck_arm.py (found via
-# tools/find_tuck.py against /check_state_validity). The older
-# [-0.5, -2.4, 0, -2.4, 0, 0, 0] clears Gazebo contacts but puts the upper arm through
-# the torso in MoveIt; grasp then saw every pre-grasp posture as "in collision" because
-# _full_state keeps the right arm where approach left it.
+# Same collision-free folds as grasp_node / tools/tuck_arm.py (find_tuck.py /
+# find_right_tuck.py). The older [-0.5, -2.4, 0, -2.4, 0, 0, 0] clears Gazebo but
+# self-collides in MoveIt. The right arm is NOT a mirror of the left: that put the
+# right gripper finger through base_link and blocked every MoveIt start state.
 TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
+RIGHT_TUCK_POSE = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
 
 
 def wrap_angle(a: float) -> float:
@@ -651,14 +651,6 @@ class ApproachNode(Node):
         pub.publish(traj)
         return True
 
-    @staticmethod
-    def _mirrored_tuck() -> List[float]:
-        """Right arm mirrors the left tuck: flip the shoulder pan and upper-arm roll."""
-        pose = list(TUCK_POSE)
-        pose[0] = -pose[0]
-        pose[2] = -pose[2]
-        return pose
-
     def _send_tuck(self) -> bool:
         """Command both arms to the driving posture.
 
@@ -666,9 +658,10 @@ class ApproachNode(Node):
         commands actually went out this call.
         """
         ok = True
-        for pub, side in ((self.pub_arm_left, "left"), (self.pub_arm_right, "right")):
+        for pub, side, pose in (
+                (self.pub_arm_left, "left", TUCK_POSE),
+                (self.pub_arm_right, "right", RIGHT_TUCK_POSE)):
             names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
-            pose = self._mirrored_tuck() if side == "right" else TUCK_POSE
             ok = self._send(pub, names, pose, self.tuck_time) and ok
         if ok:
             self.get_logger().info("stowing arms for driving")
@@ -681,7 +674,7 @@ class ApproachNode(Node):
         """
         names = ([f"arm_left_{i}_joint" for i in range(1, 8)]
                  + [f"arm_right_{i}_joint" for i in range(1, 8)])
-        targets = list(TUCK_POSE) + self._mirrored_tuck()
+        targets = list(TUCK_POSE) + list(RIGHT_TUCK_POSE)
         try:
             actual = [self.joints[name] for name in names]
         except KeyError:

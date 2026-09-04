@@ -11,6 +11,7 @@ from avaa_solution.grasp_node import (
     DEFAULT_ROW_HEIGHTS,
     GRIPPER_CLAMP,
     GRIPPER_OPEN,
+    RIGHT_TUCK_POSE,
     TUCK_POSE,
     row_to_height,
 )
@@ -94,5 +95,18 @@ def test_the_tuck_is_not_the_old_self_colliding_one():
 
 
 def test_approach_uses_the_same_collision_free_tuck():
-    from avaa_solution.approach_node import TUCK_POSE as APPROACH_TUCK
+    from avaa_solution.approach_node import (
+        RIGHT_TUCK_POSE as APPROACH_RIGHT,
+        TUCK_POSE as APPROACH_TUCK,
+    )
     assert APPROACH_TUCK == TUCK_POSE
+    assert APPROACH_RIGHT == RIGHT_TUCK_POSE
+
+
+def test_right_tuck_is_not_a_naive_mirror_of_the_left():
+    mirrored = [
+        -TUCK_POSE[0], TUCK_POSE[1], -TUCK_POSE[2],
+        TUCK_POSE[3], TUCK_POSE[4], TUCK_POSE[5], TUCK_POSE[6],
+    ]
+    assert RIGHT_TUCK_POSE != mirrored
+    assert len(RIGHT_TUCK_POSE) == 7
