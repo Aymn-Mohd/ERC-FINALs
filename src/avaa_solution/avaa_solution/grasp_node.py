@@ -46,6 +46,7 @@ import numpy as np
 import rclpy
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Pose, PointStamped, Quaternion
+from rclpy.duration import Duration as RclDuration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -567,7 +568,7 @@ class GraspNode(Node):
             self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
             self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
             self.safe_tuck_sent = True
-            self.safe_tuck_deadline = self.get_clock().now() + Duration(sec=20)
+            self.safe_tuck_deadline = self.get_clock().now() + RclDuration(seconds=20.0)
             left = self._left_tuck_gap()
             right = self._right_tuck_gap()
             self.get_logger().info(
@@ -1294,7 +1295,7 @@ class GraspNode(Node):
         self.raised = [ideal] + list(TUCK_POSE)
         # Controllers, not MoveIt: RAISE is a known fold + torso height, and MoveIt
         # refuses to start if the idle right arm is still settling into its tuck.
-        self.raise_deadline = self.get_clock().now() + Duration(sec=25)
+        self.raise_deadline = self.get_clock().now() + RclDuration(seconds=25.0)
         self._send_torso(ideal, seconds=15.0)
         self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
         self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
@@ -1362,8 +1363,8 @@ class GraspNode(Node):
         except KeyError:
             current = list(self.pre_solution)
         duration = self._send_chain_waypoints([current, list(self.pre_solution)])
-        self.pregrasp_deadline = self.get_clock().now() + Duration(
-            sec=int(duration + 8.0) + 1)
+        self.pregrasp_deadline = self.get_clock().now() + RclDuration(
+            seconds=float(duration + 8.0))
         self.get_logger().info(
             "driving analytic pre-grasp via controllers (%.1f s): %s"
             % (duration, np.round(self.pre_target, 3).tolist()))
@@ -1389,8 +1390,8 @@ class GraspNode(Node):
                     current = list(self.pre_solution)
                 duration = self._send_chain_waypoints(
                     [current, list(self.pre_solution)])
-                self.pregrasp_deadline = self.get_clock().now() + Duration(
-                    sec=int(duration + 8.0) + 1)
+                self.pregrasp_deadline = self.get_clock().now() + RclDuration(
+                    seconds=float(duration + 8.0))
                 return
             self.get_logger().error(
                 "cannot settle at the pre-grasp: %s" % self._miss(self.pre_target))
@@ -1440,8 +1441,8 @@ class GraspNode(Node):
             return
         self.reach_path = path
         duration = self._send_chain_waypoints(path)
-        self.advance_deadline = self.get_clock().now() + Duration(
-            sec=int(duration + 8.0) + 1)
+        self.advance_deadline = self.get_clock().now() + RclDuration(
+            seconds=float(duration + 8.0))
         self.get_logger().info(
             "reaching along %d IK waypoints to %s (%.1f s), stopping %.0f mm short "
             "so the last stretch can be re-aimed"
@@ -1502,8 +1503,8 @@ class GraspNode(Node):
             self.leg = 2
             self.reach_path = final
             duration = self._send_chain_waypoints(final)
-            self.advance_deadline = self.get_clock().now() + Duration(
-                sec=int(duration + 8.0) + 1)
+            self.advance_deadline = self.get_clock().now() + RclDuration(
+                seconds=float(duration + 8.0))
             self.get_logger().info(
                 "at the staging point; the book moved %.0f mm while I reached, "
                 "closing the last %.0f mm via IK (%.1f s)"
