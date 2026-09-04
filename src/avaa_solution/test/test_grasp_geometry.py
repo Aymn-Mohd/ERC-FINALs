@@ -91,3 +91,8 @@ def test_the_tuck_is_not_the_old_self_colliding_one():
     """
     assert TUCK_POSE != [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
     assert len(TUCK_POSE) == 7
+
+
+def test_approach_uses_the_same_collision_free_tuck():
+    from avaa_solution.approach_node import TUCK_POSE as APPROACH_TUCK
+    assert APPROACH_TUCK == TUCK_POSE

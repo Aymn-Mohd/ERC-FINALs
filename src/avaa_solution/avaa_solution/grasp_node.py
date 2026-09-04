@@ -61,6 +61,8 @@ TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
 TOPIC_APPROACH_STATE = "/avaa/approach/state"
 TOPIC_STATE = "/avaa/grasp/state"
 GRIPPER_TOPIC = "/gripper_left_controller_raw/joint_trajectory"
+TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
+TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
 
 ARM_JOINTS = [f"arm_left_{i}_joint" for i in range(1, 8)]
 CHAIN_JOINTS = ["torso_lift_joint"] + ARM_JOINTS
@@ -148,6 +150,12 @@ DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 # 0.49 m.
 TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
 TUCK_TORSO = 0.15
+# Right arm: flip shoulder pan and upper-arm roll (same mapping as approach_node).
+RIGHT_TUCK_POSE = [
+    -TUCK_POSE[0], TUCK_POSE[1], -TUCK_POSE[2],
+    TUCK_POSE[3], TUCK_POSE[4], TUCK_POSE[5], TUCK_POSE[6],
+]
+RIGHT_ARM_JOINTS = [f"arm_right_{i}_joint" for i in range(1, 8)]
 
 # The wrist, in base_link: reach along +x, close the fingers across y. Both come from the
 # URDF -- the fingers sit at y = +/-0.0288 offset +0.0756 along z in gripper_left_base_link,
@@ -401,7 +409,13 @@ class GraspNode(Node):
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
         self.create_subscription(String, TOPIC_APPROACH_STATE, self._on_approach, 10)
         self.pub_gripper = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
+        self.pub_arm_left = self.create_publisher(
+            JointTrajectory, TOPIC_ARM_LEFT, 10)
+        self.pub_arm_right = self.create_publisher(
+            JointTrajectory, TOPIC_ARM_RIGHT, 10)
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
+        self.safe_tuck_sent = False
+        self.safe_tuck_deadline = None
 
         self.moveit = MoveItClient("avaa_grasp_moveit")
         self.get_logger().info("waiting for move_group...")
@@ -460,6 +474,62 @@ class GraspNode(Node):
             nanosec=int((self.gripper_time % 1.0) * 1e9))
         traj.points = [point]
         self.pub_gripper.publish(traj)
+
+    def _right_tuck_gap(self) -> Optional[float]:
+        """Joint-space distance of the right arm from the collision-free tuck."""
+        try:
+            actual = [self.joints[name] for name in RIGHT_ARM_JOINTS]
+        except KeyError:
+            return None
+        return float(sum(abs(a - t) for a, t in zip(actual, RIGHT_TUCK_POSE)))
+
+    def _left_tuck_gap(self) -> Optional[float]:
+        """Joint-space distance of the left arm from the collision-free tuck."""
+        try:
+            actual = [self.joints[name] for name in ARM_JOINTS]
+        except KeyError:
+            return None
+        return float(sum(abs(a - t) for a, t in zip(actual, TUCK_POSE)))
+
+    def _send_arm_tuck(self, pub, names, pose) -> None:
+        traj = JointTrajectory()
+        traj.joint_names = list(names)
+        point = JointTrajectoryPoint()
+        point.positions = [float(v) for v in pose]
+        point.time_from_start = Duration(sec=12)
+        traj.points = [point]
+        pub.publish(traj)
+
+    def _arms_clear_for_planning(self) -> bool:
+        """Hold SCENE until both arms use the MoveIt-valid tuck.
+
+        Approach used to leave both arms in a Gazebo-only tuck that self-collides in
+        MoveIt. Every pre-grasp candidate then failed as 'in collision', and RAISE's
+        start state was invalid for the same reason. Command the collision-free fold
+        directly (controllers, not MoveIt) so the planner can start from a legal state.
+        """
+        left = self._left_tuck_gap()
+        right = self._right_tuck_gap()
+        if (left is not None and left <= 0.5
+                and right is not None and right <= 0.5):
+            return True
+        if not self.safe_tuck_sent:
+            self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
+            self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
+            self.safe_tuck_sent = True
+            self.safe_tuck_deadline = self.get_clock().now() + Duration(sec=20)
+            self.get_logger().info(
+                "folding both arms to the collision-free tuck before planning"
+                " (left %.1f rad, right %.1f rad from target)"
+                % (left if left is not None else -1.0,
+                   right if right is not None else -1.0))
+            return False
+        if (self.safe_tuck_deadline is not None
+                and self.get_clock().now() >= self.safe_tuck_deadline):
+            self.get_logger().warn(
+                "safe tuck not confirmed via /joint_states; planning anyway")
+            return True
+        return False
 
     def _hold_gripper(self, value: float, period: float = 0.6) -> None:
         """Keep re-asserting a gripper position, briefly, so it is not back-driven.
@@ -801,12 +871,22 @@ class GraspNode(Node):
         """Describe the whole robot as it is now, with the arm moved to ``solution``.
 
         Both wheels and the other arm matter to a collision check, so a start state that
-        only describes eight joints is not a description of this robot.
+        only describes eight joints is not a description of this robot. The right arm is
+        pinned to the collision-free tuck: if approach (or a prior run) left it in the
+        old self-colliding fold, every left-arm candidate would fail validity for that
+        reason alone.
         """
         names = list(self.joints.keys())
         values = [self.joints[name] for name in names]
         index = {name: position for position, name in enumerate(names)}
         for name, value in zip(CHAIN_JOINTS, solution):
+            if name in index:
+                values[index[name]] = float(value)
+            else:
+                names.append(name)
+                values.append(float(value))
+                index[name] = len(names) - 1
+        for name, value in zip(RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE):
             if name in index:
                 values[index[name]] = float(value)
             else:
@@ -839,6 +919,10 @@ class GraspNode(Node):
         # seeded walk through the same reach was clear at every step.
         seed = self._current_joints()
         for attempt in range(attempts):
+            if attempt == 0 or (attempt + 1) % 3 == 0:
+                self.get_logger().info(
+                    "pre-grasp search: try %d/%d (%d clear so far, %d in collision)"
+                    % (attempt + 1, attempts, len(candidates), rejected))
             solution = self.chain.ik(
                 self.pre_target, seed=seed if attempt == 0 else None,
                 approach=GRASP_APPROACH, closing=GRASP_CLOSING,
@@ -1120,6 +1204,8 @@ class GraspNode(Node):
         self._enter(State.SCENE)
 
     def _do_scene(self) -> None:
+        if not self._arms_clear_for_planning():
+            return
         if not self._add_shelf():
             self.get_logger().error("could not describe the shelf to the planner")
             self._enter(State.FAILED)
@@ -1129,6 +1215,9 @@ class GraspNode(Node):
         # candidate against whatever geometry was left over from the previous run, which
         # produced a posture reported as 100 per cent clear and then an invalid motion
         # plan the moment the real boards went in.
+        self.get_logger().info(
+            "searching for a pre-grasp posture that can reach into the shelf "
+            "(up to 12 MoveIt checks; can take a minute at low RTF)...")
         self.pre_solution = self._posture_that_can_reach_in()
         if self.pre_solution is None:
             self.get_logger().error(

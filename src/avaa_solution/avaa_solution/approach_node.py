@@ -130,15 +130,12 @@ SENSOR_QOS = QoSProfile(
 # while the LiDAR still read 0.94 m of clear space ahead. Each contact event costs half a
 # point.
 #
-# This pose measured 0.319 m forward and 0.174 m lateral, both inside the base footprint
-# (0.36 m half-length, 0.249 m half-width), with no contacts. Joint 2 does most of the
-# work; the elbow pulls the forearm in laterally, and joint 1 finishes the job.
-#
-# NOTE: this posture puts arm_left_2 through arm_left_5 in self-collision against
-# torso_base_link and torso_lift_link (found later when MoveIt was added for grasping;
-# Gazebo does not check self-collision, so it never mattered for driving). Left as the
-# original measured value for now -- revisit if/when arm work resumes.
-TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
+# Same collision-free fold as grasp_node / tools/tuck_arm.py (found via
+# tools/find_tuck.py against /check_state_validity). The older
+# [-0.5, -2.4, 0, -2.4, 0, 0, 0] clears Gazebo contacts but puts the upper arm through
+# the torso in MoveIt; grasp then saw every pre-grasp posture as "in collision" because
+# _full_state keeps the right arm where approach left it.
+TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
 
 
 def wrap_angle(a: float) -> float:
