@@ -183,7 +183,11 @@ class ApproachNode(Node):
         # envelope, which cannot be settled until grasping exists.
         self.declare_parameter("standoff_m", 0.75)
         self.declare_parameter("centre_tolerance_px", 12.0)
-        self.declare_parameter("standoff_tolerance_m", 0.05)
+        # 0.10 rather than 0.05: the final drive was measured stalling at ahead≈0.82–0.88
+        # with remaining 0.07–0.13 while vy fought a few centimetres of lateral error and
+        # the base slid back along x. Accepting that band still leaves the arm inside its
+        # measured envelope; insisting on 5 cm just timed out.
+        self.declare_parameter("standoff_tolerance_m", 0.10)
         self.declare_parameter("square_tolerance_rad", 0.05)
         self.declare_parameter("max_yaw_rate", 0.45)
         self.declare_parameter("max_forward", 0.22)
@@ -1338,9 +1342,11 @@ class ApproachNode(Node):
         self._aim_head()
 
         cmd = Twist()
-        cmd.linear.x = min(self.max_fwd, max(0.05, 0.5 * remaining))
+        # Floor vx a little higher than 0.05 on the last metres: at GUI RTF the old
+        # floor was slower than the base's sideways drift, so remaining never closed.
+        cmd.linear.x = min(self.max_fwd, max(0.08, 0.5 * remaining))
 
-        # Correct sideways, not by turning.
+        # Correct sideways, not by turning -- but NOT on the final stretch to standoff.
         #
         # Turning to chase the bearing while driving converts a small angular error into a
         # large lateral excursion: the robot yaws a little, then drives along the new
@@ -1351,27 +1357,37 @@ class ApproachNode(Node):
         # dy = +0.233 with dyaw = 0.000), so lateral error can be taken out directly while
         # the heading stays square to the shelf. The earlier belief that strafing yaws the
         # base was an artefact of measuring with the arms extended.
-        # Steer to the anchored target while one is held, falling back to the live
-        # marker bearing only before there is one. The bearing is what jumped.
-        target = self._target_in_base()
-        if target is not None:
-            # Line the book up with the shoulder, not with the middle of the robot.
-            error_m = float(target[1]) - SHOULDER_OFFSET_Y
-            bearing = f"{error_m:+.3f}m"
-            if abs(error_m) > self.centre_tol_m:
-                # +y is to the left of the base, and so is a positive error.
-                cmd.linear.y = math.copysign(
-                    min(self.max_lateral, 0.6 * abs(error_m) + 0.02), error_m)
-        else:
-            column_cx = self._column_cx_fresh()
-            bearing = "stale"
-            if column_cx is not None:
-                error_px = column_cx - self.image_width / 2.0
-                bearing = f"{error_px:+6.1f}px"
-                if abs(error_px) > self.centre_tol:
-                    # Image x grows to the right; +y is to the left of the base.
-                    cmd.linear.y = -math.copysign(
-                        min(self.max_lateral, 0.0012 * abs(error_px)), error_px)
+        #
+        # Exception -- final close to grasping standoff: simultaneous vy was measured
+        # larger than vx while remaining sat at 0.07–0.15 m, and ahead drifted from
+        # 0.82 m back out to 0.89 m until the state timed out. ACQUIRE already lined the
+        # book up; on this last stretch only drive forward.
+        final_stretch = (
+            self.approach_target <= self.standoff + 1e-9 and remaining < 0.35
+        )
+        bearing = "final"
+        if not final_stretch:
+            # Steer to the anchored target while one is held, falling back to the live
+            # marker bearing only before there is one. The bearing is what jumped.
+            target = self._target_in_base()
+            if target is not None:
+                # Line the book up with the shoulder, not with the middle of the robot.
+                error_m = float(target[1]) - SHOULDER_OFFSET_Y
+                bearing = f"{error_m:+.3f}m"
+                if abs(error_m) > self.centre_tol_m:
+                    # +y is to the left of the base, and so is a positive error.
+                    cmd.linear.y = math.copysign(
+                        min(self.max_lateral, 0.6 * abs(error_m) + 0.02), error_m)
+            else:
+                column_cx = self._column_cx_fresh()
+                bearing = "stale"
+                if column_cx is not None:
+                    error_px = column_cx - self.image_width / 2.0
+                    bearing = f"{error_px:+6.1f}px"
+                    if abs(error_px) > self.centre_tol:
+                        # Image x grows to the right; +y is to the left of the base.
+                        cmd.linear.y = -math.copysign(
+                            min(self.max_lateral, 0.0012 * abs(error_px)), error_px)
         self.pub_cmd.publish(cmd)
 
         # Log what was commanded alongside what the range is doing. Range alone cannot
