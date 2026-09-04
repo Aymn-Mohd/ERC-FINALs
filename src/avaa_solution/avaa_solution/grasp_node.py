@@ -58,6 +58,7 @@ from avaa_solution.moveit_client import MoveItClient, error_name
 
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
+TOPIC_APPROACH_STATE = "/avaa/approach/state"
 TOPIC_STATE = "/avaa/grasp/state"
 GRIPPER_TOPIC = "/gripper_left_controller_raw/joint_trajectory"
 
@@ -387,10 +388,18 @@ class GraspNode(Node):
         self.motion_thread: Optional[threading.Thread] = None
         self.motion_result = None
         self.motion_label = ""
+        # None until /avaa/approach/state is heard. ideal_grasp runs without approach, so
+        # None means "no approach node; start when the book is known". A real trial always
+        # publishes approach state, and we must not leave IDLE until it is "done" --
+        # starting mid-drive (measured: SCENE at 3 m while the base was still closing)
+        # hands MoveIt a raise while approach still owns the arm, and RAISE hangs with no
+        # further grasp logs while perception keeps tracking happily.
+        self.approach_state: Optional[str] = None
 
         self.create_subscription(Int32, TOPIC_TARGET_ROW, self._on_row, 10)
         self.create_subscription(PointStamped, TOPIC_BOOK_POINT, self._on_book, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
+        self.create_subscription(String, TOPIC_APPROACH_STATE, self._on_approach, 10)
         self.pub_gripper = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
 
@@ -412,6 +421,9 @@ class GraspNode(Node):
 
     def _on_row(self, msg: Int32) -> None:
         self.row = int(msg.data)
+
+    def _on_approach(self, msg: String) -> None:
+        self.approach_state = msg.data
 
     def _on_book(self, msg: PointStamped) -> None:
         """Hold the median of recent sightings, not the latest one."""
@@ -1094,9 +1106,17 @@ class GraspNode(Node):
             return
         if self.row is None or self.book is None:
             return
+        # Hold until the base has finished. Starting earlier plans against a far book,
+        # then fights approach for the arm on RAISE.
+        if self.approach_state is not None and self.approach_state != "done":
+            return
         if not self._plan_targets():
             self._enter(State.FAILED)
             return
+        if self.approach_state == "done":
+            self.get_logger().info(
+                "approach done; starting the grasp at book face "
+                "x=%.3f y=%+.3f" % (float(self.book[0]), float(self.book[1])))
         self._enter(State.SCENE)
 
     def _do_scene(self) -> None:

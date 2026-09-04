@@ -24,3 +24,6 @@ Thumbs.db
 # erc_images/ is a Phase 1 deliverable: the solution node writes timestamped
 # annotated images there during a trial and judges use them to award the
 # identification points. Those must be committed, not ignored.
+
+# Trial console logs from scripts/run_solution.sh (large, machine-local).
+src/avaa_solution/logs/
