@@ -396,6 +396,8 @@ class GraspNode(Node):
         self.pre_solution = None
         self.raised = None
         self.raise_deadline = None
+        self.pregrasp_deadline = None
+        self.advance_deadline = None
 
         self.motion_thread: Optional[threading.Thread] = None
         self.motion_result = None
@@ -514,6 +516,43 @@ class GraspNode(Node):
             sec=int(seconds), nanosec=int((seconds % 1.0) * 1e9))
         traj.points = [point]
         self.pub_torso.publish(traj)
+
+    def _send_chain_waypoints(self, waypoints, arm_speed: float = 0.22,
+                              torso_speed: float = 0.05) -> float:
+        """Play analytic IK waypoints on the arm/torso controllers (not MoveIt).
+
+        Offline IK shows every stocked row is reachable from the tuck at the approach
+        standoffs we use. MoveIt planning from the live start state is what was failing
+        (idle right arm in self-collision). Executing the joint solutions we already
+        trust skips that trap.
+        """
+        if not waypoints:
+            return 0.0
+        arm = JointTrajectory()
+        arm.joint_names = list(ARM_JOINTS)
+        torso = JointTrajectory()
+        torso.joint_names = ["torso_lift_joint"]
+        moment = 0.0
+        previous = None
+        for values in waypoints:
+            values = [float(v) for v in values]
+            if previous is not None:
+                arm_move = max(abs(a - b) for a, b in zip(values[1:], previous[1:]))
+                torso_move = abs(values[0] - previous[0])
+                moment += max(0.50, arm_move / arm_speed, torso_move / torso_speed)
+            point = JointTrajectoryPoint()
+            point.positions = values[1:]
+            point.time_from_start = Duration(
+                sec=int(moment), nanosec=int((moment % 1.0) * 1e9))
+            arm.points.append(point)
+            lift = JointTrajectoryPoint()
+            lift.positions = [values[0]]
+            lift.time_from_start = point.time_from_start
+            torso.points.append(lift)
+            previous = values
+        self.pub_arm_left.publish(arm)
+        self.pub_torso.publish(torso)
+        return moment
 
     def _arms_clear_for_planning(self) -> bool:
         """Hold SCENE until both arms use the MoveIt-valid tuck.
@@ -1315,27 +1354,28 @@ class GraspNode(Node):
             self.get_logger().warn(
                 "the re-aimed pre-grasp is not collision free; keeping the planned one")
 
+        # Analytic IK -> joint trajectory. Do not ask MoveIt to plan to this posture:
+        # the solution is already known, and planning fails whenever the start state is
+        # briefly invalid (measured: right gripper vs base_link).
+        try:
+            current = [self.joints[name] for name in CHAIN_JOINTS]
+        except KeyError:
+            current = list(self.pre_solution)
+        duration = self._send_chain_waypoints([current, list(self.pre_solution)])
+        self.pregrasp_deadline = self.get_clock().now() + Duration(
+            sec=int(duration + 8.0) + 1)
+        self.get_logger().info(
+            "driving analytic pre-grasp via controllers (%.1f s): %s"
+            % (duration, np.round(self.pre_target, 3).tolist()))
         self._enter(State.PREGRASP)
-        self._start("pre-grasp", lambda: self.moveit.move_to_joints(
-            CHAIN_JOINTS, self.pre_solution, timeout=240.0))
 
     def _do_pregrasp(self) -> None:
-        done = self._finished()
-        if done is None:
+        arrived = self._arrived(self.pre_target, self.pregrasp_tol)
+        timed_out = (self.pregrasp_deadline is not None
+                     and self.get_clock().now() >= self.pregrasp_deadline)
+        if arrived is not True and not timed_out:
             return
-        code, _ = done
-        if code != 1:
-            self.get_logger().error(
-                "could not reach the pre-grasp %s: %s%s"
-                % (np.round(self.pre_target, 3).tolist(), error_name(code),
-                   " -- " + self.moveit.last_failure
-                   if self.moveit.last_failure else ""))
-            self._enter(State.FAILED)
-            return
-        # The reach that follows is a straight line from wherever the arm actually is,
-        # so being short here moves sideways there. One run left the pre-grasp 119 mm off
-        # in y and the Cartesian path faithfully carried that error into the shelf.
-        if self._arrived(self.pre_target, self.pregrasp_tol) is False:
+        if arrived is not True:
             self.reaches += 1
             if self.reaches < self.reach_attempts:
                 self.get_logger().warn(
@@ -1343,8 +1383,14 @@ class GraspNode(Node):
                     % (self._miss(self.pre_target), self.reaches, self.reach_attempts))
                 if self._nudge(self.pre_solution):
                     return
-                self._start("pre-grasp", lambda: self.moveit.move_to_joints(
-                    CHAIN_JOINTS, self.pre_solution, timeout=240.0))
+                try:
+                    current = [self.joints[name] for name in CHAIN_JOINTS]
+                except KeyError:
+                    current = list(self.pre_solution)
+                duration = self._send_chain_waypoints(
+                    [current, list(self.pre_solution)])
+                self.pregrasp_deadline = self.get_clock().now() + Duration(
+                    sec=int(duration + 8.0) + 1)
                 return
             self.get_logger().error(
                 "cannot settle at the pre-grasp: %s" % self._miss(self.pre_target))
@@ -1393,32 +1439,30 @@ class GraspNode(Node):
             self._enter(State.FAILED)
             return
         self.reach_path = path
+        duration = self._send_chain_waypoints(path)
+        self.advance_deadline = self.get_clock().now() + Duration(
+            sec=int(duration + 8.0) + 1)
         self.get_logger().info(
-            "reaching along %d waypoints to %s, stopping %.0f mm short so the last "
-            "stretch can be re-aimed"
-            % (len(path), np.round(leg_end, 3).tolist(),
+            "reaching along %d IK waypoints to %s (%.1f s), stopping %.0f mm short "
+            "so the last stretch can be re-aimed"
+            % (len(path), np.round(leg_end, 3).tolist(), duration,
                float(np.linalg.norm(np.asarray(self.grasp_target) - leg_end)) * 1000))
         self._enter(State.ADVANCE)
-        self._start("reach", lambda: self.moveit.execute_path(CHAIN_JOINTS, path))
 
     def _do_advance(self) -> None:
         # Keep the jaws open on the way in. They are back-driven by the arm's own
         # motion, and arriving at the book with them already shut is how a reach that
         # lands within 2 mm still closes on nothing.
         self._hold_gripper(GRIPPER_OPEN)
-        done = self._finished()
-        if done is None:
+        target = self.leg_target if self.leg == 1 else self.grasp_target
+        arrived = self._arrived(target) if target is not None else None
+        timed_out = (self.advance_deadline is not None
+                     and self.get_clock().now() >= self.advance_deadline)
+        if arrived is not True and not timed_out:
             return
-        code, fraction = done
-        if fraction < self.min_fraction:
-            # Not a controller failure: the planner is saying the reach is obstructed.
+        if arrived is not True:
             self.get_logger().error(
-                "the reach into the shelf is blocked: only %.0f%% of it is clear"
-                % (fraction * 100.0))
-            self._enter(State.FAILED)
-            return
-        if code != 1:
-            self.get_logger().error("the reach failed: %s" % error_name(code))
+                "the reach did not arrive (%s)" % self._miss(target))
             self._enter(State.FAILED)
             return
 
@@ -1457,10 +1501,13 @@ class GraspNode(Node):
                 return
             self.leg = 2
             self.reach_path = final
+            duration = self._send_chain_waypoints(final)
+            self.advance_deadline = self.get_clock().now() + Duration(
+                sec=int(duration + 8.0) + 1)
             self.get_logger().info(
                 "at the staging point; the book moved %.0f mm while I reached, "
-                "closing the last %.0f mm" % (drifted * 1000, remaining * 1000))
-            self._start("reach", lambda: self.moveit.execute_path(CHAIN_JOINTS, final))
+                "closing the last %.0f mm via IK (%.1f s)"
+                % (drifted * 1000, remaining * 1000, duration))
             return
 
         # Wait for the base to go quiet before closing.
