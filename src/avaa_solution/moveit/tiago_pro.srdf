@@ -20,14 +20,14 @@
     </group>
     <!--GROUP STATES: Purpose: Define a named state for a particular group, in terms of joint values. This is useful to define states like 'folded arms'-->
     <group_state name="tuck" group="arm_left_torso">
-        <joint name="arm_left_1_joint" value="2.1521"/>
-        <joint name="arm_left_2_joint" value="0.3824"/>
-        <joint name="arm_left_3_joint" value="1.2785"/>
-        <joint name="arm_left_4_joint" value="-2.1517"/>
-        <joint name="arm_left_5_joint" value="0.8325"/>
-        <joint name="arm_left_6_joint" value="0.1926"/>
-        <joint name="arm_left_7_joint" value="1.3944"/>
-        <joint name="torso_lift_joint" value="0.15"/>
+        <joint name="arm_left_1_joint" value="0.36"/>
+        <joint name="arm_left_2_joint" value="-1.83"/>
+        <joint name="arm_left_3_joint" value="0.47"/>
+        <joint name="arm_left_4_joint" value="-2.35"/>
+        <joint name="arm_left_5_joint" value="0.0"/>
+        <joint name="arm_left_6_joint" value="-1.5463"/>
+        <joint name="arm_left_7_joint" value="0.0"/>
+        <joint name="torso_lift_joint" value="0.10"/>
     </group_state>
     <group_state name="open" group="gripper_left">
         <joint name="gripper_left_finger_joint" value="0.04"/>

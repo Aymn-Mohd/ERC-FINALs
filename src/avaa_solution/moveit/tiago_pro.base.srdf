@@ -46,21 +46,17 @@
 
   <!-- Poses this solution actually commands, so they can be named in plans and in the
        report rather than repeated as magic numbers. -->
-  <!-- Folded and collision free, which the obvious tuck is not: all the negatives,
-       [-0.5, -2.4, 0, -2.4, 0, 0, 0], puts arm_left_2 through arm_left_5 against
-       torso_base_link and torso_lift_link. Gazebo does not check self-collision so it
-       went unnoticed for the whole project, and MoveIt would not plan from it at all.
-       Found by sampling folded postures against /check_state_validity, keeping the most
-       compact with 0.15 rad of room at every stop. See tools/find_tuck.py. -->
+  <!-- PAL official home (straight-wrist motions yaml). Folded via staged waypoints
+       in approach/grasp; this is the settled pose MoveIt / FK treat as tucked. -->
   <group_state name="tuck" group="arm_left_torso">
-    <joint name="torso_lift_joint" value="0.15"/>
-    <joint name="arm_left_1_joint" value="2.1521"/>
-    <joint name="arm_left_2_joint" value="0.3824"/>
-    <joint name="arm_left_3_joint" value="1.2785"/>
-    <joint name="arm_left_4_joint" value="-2.1517"/>
-    <joint name="arm_left_5_joint" value="0.8325"/>
-    <joint name="arm_left_6_joint" value="0.1926"/>
-    <joint name="arm_left_7_joint" value="1.3944"/>
+    <joint name="torso_lift_joint" value="0.10"/>
+    <joint name="arm_left_1_joint" value="0.36"/>
+    <joint name="arm_left_2_joint" value="-1.83"/>
+    <joint name="arm_left_3_joint" value="0.47"/>
+    <joint name="arm_left_4_joint" value="-2.35"/>
+    <joint name="arm_left_5_joint" value="0.0"/>
+    <joint name="arm_left_6_joint" value="-1.5463"/>
+    <joint name="arm_left_7_joint" value="0.0"/>
   </group_state>
 
   <group_state name="open" group="gripper_left">

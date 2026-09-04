@@ -138,26 +138,25 @@ GRIPPER_CLAMP = -0.0010
 
 DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
-# Folded, and collision free -- which the previous tuck was not.
+# Folded for driving / MoveIt start. Final pose is PAL's official home; the path to
+# it is staged (see TUCK_WAYPOINTS_*) because a single jump from arms-out swings the
+# elbows through the torso (observed in Gazebo as both arms striking the robot).
 #
-# [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0] puts arm_left_2 through arm_left_5 against
-# torso_base_link and torso_lift_link. Gazebo never objected, because self-collision is
-# not checked there, so it went unnoticed for the whole project until MoveIt refused to
-# plan from it: the start state was invalid and every request came back 'Motion planning
-# start tree could not be initialized'.
-#
-# This one was found by sampling folded postures and asking /check_state_validity,
-# keeping the most compact one with at least 0.15 rad of room at every joint stop. It is
-# also tighter than the old one: the gripper sits 0.29 m from the base axis rather than
-# 0.49 m.
-TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
-TUCK_TORSO = 0.15
-# Not a mirror of the left tuck. Flipping joints 0 and 2 puts
-# gripper_right_base_finger_right_link through base_link -- MoveIt then refuses every
-# left-arm plan with "start tree could not be initialized" while /check_state_validity
-# for arm_left_torso still passes (it does not care about the idle arm). Measured via
-# tools/find_right_tuck.py; same values as tools/tuck_arm.py.
-RIGHT_TUCK_POSE = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
+# Source: tiago_pro_bringup/.../tiago_pro_motions_general_straight-wrist.yaml "home"
+TUCK_WAYPOINTS_LEFT = [
+    [1.8557, -1.5919, 0.35538, -2.0502, 0.10524, -1.5976, 0.0],
+    [0.26, -1.6008, 0.3489, -1.9818, 0.0, -1.5829, 0.0],
+    [0.36, -1.83, 0.47, -2.35, 0.0, -1.5463, 0.0],
+]
+TUCK_WAYPOINTS_RIGHT = [
+    [-1.8614, -1.6008, -0.34892, -1.9818, 0.10153, -1.5829, 0.0],
+    [-0.26, -1.6008, -0.3489, -1.9818, 0.0, -1.5829, 0.0],
+    [-0.36, -1.83, -0.47, -2.35, 0.0, -1.5569, 0.0],
+]
+TUCK_WAYPOINT_TIMES = [5.0, 10.0, 15.0]
+TUCK_POSE = TUCK_WAYPOINTS_LEFT[-1]
+TUCK_TORSO = 0.10
+RIGHT_TUCK_POSE = TUCK_WAYPOINTS_RIGHT[-1]
 RIGHT_ARM_JOINTS = [f"arm_right_{i}_joint" for i in range(1, 8)]
 
 # The wrist, in base_link: reach along +x, close the fingers across y. Both come from the
@@ -322,6 +321,11 @@ class GraspNode(Node):
         # this settle plus the arrival check. Arriving early is cheap -- the check simply
         # fails and the reach is retried -- while waiting is not.
         self.declare_parameter("settle_sec", 1.8)
+        # Perception can jump to a neighbouring book (measured: 450 mm then 527 mm in
+        # one run while three blue candidates were in view). That is not base slide;
+        # accepting it turns a validated pre-grasp into an unreachable line. Cap the
+        # correction so only real drift is followed.
+        self.declare_parameter("max_reaim_m", 0.10)
 
         self.row_heights = list(
             self.get_parameter("row_heights").get_parameter_value().double_array_value
@@ -354,7 +358,12 @@ class GraspNode(Node):
         self.leg = 0
         self.leg_target = None
         self.settle = float(self.get_parameter("settle_sec").value)
+        self.max_reaim = float(self.get_parameter("max_reaim_m").value)
         self.settled_at = None
+        # Row and face locked when the grasp starts, so mid-reach perception flips
+        # (row 4 → 2 → 4 in one log) cannot retarget the arm onto another book.
+        self.locked_row: Optional[int] = None
+        self.targets_locked = False
 
         self.chain = ArmChain.from_urdf()
         self.state = State.IDLE
@@ -442,6 +451,8 @@ class GraspNode(Node):
     # ------------------------------------------------------------------ inputs
 
     def _on_row(self, msg: Int32) -> None:
+        if self.targets_locked:
+            return
         self.row = int(msg.data)
 
     def _on_approach(self, msg: String) -> None:
@@ -499,13 +510,22 @@ class GraspNode(Node):
             return None
         return float(sum(abs(a - t) for a, t in zip(actual, TUCK_POSE)))
 
-    def _send_arm_tuck(self, pub, names, pose) -> None:
+    def _send_arm_tuck(self, pub, names, waypoints=None, times=None) -> None:
+        """Staged fold onto the controllers (default: PAL home waypoints)."""
+        if waypoints is None:
+            waypoints = (TUCK_WAYPOINTS_LEFT if names == ARM_JOINTS
+                         or list(names) == list(ARM_JOINTS)
+                         else TUCK_WAYPOINTS_RIGHT)
+        if times is None:
+            times = TUCK_WAYPOINT_TIMES
         traj = JointTrajectory()
         traj.joint_names = list(names)
-        point = JointTrajectoryPoint()
-        point.positions = [float(v) for v in pose]
-        point.time_from_start = Duration(sec=12)
-        traj.points = [point]
+        for pose, seconds in zip(waypoints, times):
+            point = JointTrajectoryPoint()
+            point.positions = [float(v) for v in pose]
+            point.time_from_start = Duration(
+                sec=int(seconds), nanosec=int((seconds % 1.0) * 1e9))
+            traj.points.append(point)
         pub.publish(traj)
 
     def _send_torso(self, height: float, seconds: float = 12.0) -> None:
@@ -565,14 +585,16 @@ class GraspNode(Node):
         """
         if not self.safe_tuck_sent:
             self._send_torso(TUCK_TORSO)
-            self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
-            self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
+            self._send_arm_tuck(
+                self.pub_arm_left, ARM_JOINTS, TUCK_WAYPOINTS_LEFT)
+            self._send_arm_tuck(
+                self.pub_arm_right, RIGHT_ARM_JOINTS, TUCK_WAYPOINTS_RIGHT)
             self.safe_tuck_sent = True
-            self.safe_tuck_deadline = self.get_clock().now() + RclDuration(seconds=20.0)
+            self.safe_tuck_deadline = self.get_clock().now() + RclDuration(seconds=22.0)
             left = self._left_tuck_gap()
             right = self._right_tuck_gap()
             self.get_logger().info(
-                "folding both arms to the collision-free tuck before planning"
+                "folding both arms along PAL home waypoints before planning"
                 " (left %.1f rad, right %.1f rad from target)"
                 % (left if left is not None else -1.0,
                    right if right is not None else -1.0))
@@ -741,11 +763,19 @@ class GraspNode(Node):
                 pre = np.array([max(face_x - self.standoff, self.min_pregrasp_x),
                                 y, height])
                 grasp = np.array([face_x + self.grasp_depth, y, height])
-                moved = float(np.linalg.norm(grasp - self.grasp_target))
-                if moved > 0.005:
-                    self.get_logger().info(
-                        "the base has slid; re-aimed from perception, target moved "
-                        "%.0f mm" % (moved * 1000))
+                if self.grasp_target is not None:
+                    moved = float(np.linalg.norm(grasp - self.grasp_target))
+                    if moved > self.max_reaim:
+                        self.get_logger().warn(
+                            "perception jumped %.0f mm (cap %.0f mm) — likely another "
+                            "book; holding the locked target at %s"
+                            % (moved * 1000, self.max_reaim * 1000,
+                               np.round(self.grasp_target, 3).tolist()))
+                        return
+                    if moved > 0.005:
+                        self.get_logger().info(
+                            "the base has slid; re-aimed from perception, target moved "
+                            "%.0f mm" % (moved * 1000))
                 self.face_x = face_x
                 self.pre_target = pre
                 self.grasp_target = grasp
@@ -1259,6 +1289,8 @@ class GraspNode(Node):
             self.get_logger().info(
                 "approach done; starting the grasp at book face "
                 "x=%.3f y=%+.3f" % (float(self.book[0]), float(self.book[1])))
+        self.locked_row = self.row
+        self.targets_locked = True
         self._enter(State.SCENE)
 
     def _do_scene(self) -> None:
@@ -1297,8 +1329,11 @@ class GraspNode(Node):
         # refuses to start if the idle right arm is still settling into its tuck.
         self.raise_deadline = self.get_clock().now() + RclDuration(seconds=25.0)
         self._send_torso(ideal, seconds=15.0)
-        self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
-        self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
+        # Hold the final home pose (already folded); do not re-run the full fold path.
+        self._send_arm_tuck(
+            self.pub_arm_left, ARM_JOINTS, [TUCK_POSE], [5.0])
+        self._send_arm_tuck(
+            self.pub_arm_right, RIGHT_ARM_JOINTS, [RIGHT_TUCK_POSE], [5.0])
         self.get_logger().info(
             "raising torso to %.2f m with arms folded (joint trajectories)" % ideal)
         self._enter(State.RAISE)
@@ -1408,19 +1443,9 @@ class GraspNode(Node):
         waited = (self.get_clock().now() - self.open_at).nanoseconds / 1e9
         if waited < self.gripper_time + 0.5:
             return
-        self._refresh_targets()
-        # Build the reach from the posture that was checked, not from where the arm
-        # happens to have stopped. They are a centimetre apart, but the analytic solver
-        # seeds from whatever it is given and a different seed lands on a different
-        # branch of a redundant arm: the same reach validated 100 per cent clear from the
-        # planned posture and 12 per cent from the arm one centimetre away from it.
-        # MoveIt tolerates a start that close, so the validated path is the one to run.
-        #
-        # Start it from the point that posture actually reaches, not from pre_target.
-        # Re-aiming moves pre_target -- 51 mm in one run -- and the line was then being
-        # drawn from a point the starting posture is not at, so its first step was a
-        # jump rather than a step and the whole reach came back obstructed 12 per cent
-        # in. The posture and the point it reaches have to be the same thing.
+        # Do not re-aim here. The pre-grasp posture was solved for the locked target;
+        # a 0.5 m perception jump (seen in logs with multiple blue candidates) makes
+        # the straight line from that posture unreachable.
         start_point = np.asarray(self.chain.fk(list(self.pre_solution))[:3, 3],
                                  dtype=float)
 
@@ -1437,6 +1462,10 @@ class GraspNode(Node):
 
         path = self._straight_path(self.pre_solution, start_point, leg_end)
         if path is None:
+            self.get_logger().error(
+                "no clear line from pre-grasp %s into the shelf toward %s"
+                % (np.round(start_point, 3).tolist(),
+                   np.round(self.grasp_target, 3).tolist()))
             self._enter(State.FAILED)
             return
         self.reach_path = path

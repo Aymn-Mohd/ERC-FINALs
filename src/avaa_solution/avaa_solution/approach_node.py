@@ -130,12 +130,23 @@ SENSOR_QOS = QoSProfile(
 # while the LiDAR still read 0.94 m of clear space ahead. Each contact event costs half a
 # point.
 #
-# Same collision-free folds as grasp_node / tools/tuck_arm.py (find_tuck.py /
-# find_right_tuck.py). The older [-0.5, -2.4, 0, -2.4, 0, 0, 0] clears Gazebo but
-# self-collides in MoveIt. The right arm is NOT a mirror of the left: that put the
-# right gripper finger through base_link and blocked every MoveIt start state.
-TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
-RIGHT_TUCK_POSE = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
+# PAL official "home" fold from tiago_pro_motions_general_straight-wrist.yaml.
+# A single JointTrajectory point from the spawn pose (arms out) through the torso
+# hits the robot; these staged waypoints lift elbows clear first, then settle.
+TUCK_WAYPOINTS_LEFT = [
+    [1.8557, -1.5919, 0.35538, -2.0502, 0.10524, -1.5976, 0.0],
+    [0.26, -1.6008, 0.3489, -1.9818, 0.0, -1.5829, 0.0],
+    [0.36, -1.83, 0.47, -2.35, 0.0, -1.5463, 0.0],
+]
+TUCK_WAYPOINTS_RIGHT = [
+    [-1.8614, -1.6008, -0.34892, -1.9818, 0.10153, -1.5829, 0.0],
+    [-0.26, -1.6008, -0.3489, -1.9818, 0.0, -1.5829, 0.0],
+    [-0.36, -1.83, -0.47, -2.35, 0.0, -1.5569, 0.0],
+]
+# Seconds from trajectory start for each waypoint (PAL uses 0/5/10; give sim margin).
+TUCK_WAYPOINT_TIMES = [5.0, 10.0, 15.0]
+TUCK_POSE = TUCK_WAYPOINTS_LEFT[-1]
+RIGHT_TUCK_POSE = TUCK_WAYPOINTS_RIGHT[-1]
 
 
 def wrap_angle(a: float) -> float:
@@ -211,7 +222,7 @@ class ApproachNode(Node):
         # of wall clock. The ordinary state timeout would abort mid-sweep.
         self.declare_parameter("search_timeout_sec", 150.0)
         self.declare_parameter("image_width_px", 640)
-        self.declare_parameter("tuck_time_sec", 5.0)
+        self.declare_parameter("tuck_time_sec", 18.0)
         # Where to stop in front of the collection bin, and whether to go there at all.
         # Picking/placing is not built yet -- this just gets the base into position.
         self.declare_parameter("return_to_bin", True)
@@ -651,20 +662,42 @@ class ApproachNode(Node):
         pub.publish(traj)
         return True
 
+    def _send_waypoints(self, pub, names: List[str],
+                        waypoints: List[List[float]], times: List[float]) -> bool:
+        """Publish a multi-point JointTrajectory (for a staged fold that clears the body)."""
+        if pub.get_subscription_count() == 0:
+            self.get_logger().warn(
+                f"nothing is listening on {pub.topic_name} yet; holding the command",
+                throttle_duration_sec=2.0)
+            return False
+        traj = JointTrajectory()
+        traj.joint_names = list(names)
+        for pose, seconds in zip(waypoints, times):
+            point = JointTrajectoryPoint()
+            point.positions = [float(v) for v in pose]
+            point.time_from_start = Duration(
+                sec=int(seconds), nanosec=int((seconds % 1.0) * 1e9))
+            traj.points.append(point)
+        pub.publish(traj)
+        return True
+
     def _send_tuck(self) -> bool:
-        """Command both arms to the driving posture.
+        """Command both arms along the PAL home fold (staged, not one jump).
 
         Only once something is listening on both controllers. Returns whether both
         commands actually went out this call.
         """
         ok = True
-        for pub, side, pose in (
-                (self.pub_arm_left, "left", TUCK_POSE),
-                (self.pub_arm_right, "right", RIGHT_TUCK_POSE)):
+        for pub, side, waypoints in (
+                (self.pub_arm_left, "left", TUCK_WAYPOINTS_LEFT),
+                (self.pub_arm_right, "right", TUCK_WAYPOINTS_RIGHT)):
             names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
-            ok = self._send(pub, names, pose, self.tuck_time) and ok
+            ok = self._send_waypoints(
+                pub, names, waypoints, TUCK_WAYPOINT_TIMES) and ok
         if ok:
-            self.get_logger().info("stowing arms for driving")
+            self.get_logger().info(
+                "stowing arms for driving (PAL home fold, %d waypoints)"
+                % len(TUCK_WAYPOINTS_LEFT))
         return ok
 
     def _tuck_gap(self) -> Optional[float]:

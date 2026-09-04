@@ -86,21 +86,22 @@ def test_the_tuck_is_not_the_old_self_colliding_one():
 
     [-0.5, -2.4, 0, -2.4, 0, 0, 0] puts arm_left_2 through arm_left_5 against
     torso_base_link and torso_lift_link. Gazebo does not check self-collision so nothing
-    complained, and MoveIt then would not plan from it at all. The replacement is checked
-    against /check_state_validity by tools/find_tuck.py, which needs a running simulator
-    and so cannot be asserted here; what can be asserted is that the old one is gone.
+    complained, and MoveIt then would not plan from it at all. We now use PAL's home.
     """
     assert TUCK_POSE != [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
     assert len(TUCK_POSE) == 7
+    assert TUCK_POSE == [0.36, -1.83, 0.47, -2.35, 0.0, -1.5463, 0.0]
 
 
 def test_approach_uses_the_same_collision_free_tuck():
     from avaa_solution.approach_node import (
         RIGHT_TUCK_POSE as APPROACH_RIGHT,
         TUCK_POSE as APPROACH_TUCK,
+        TUCK_WAYPOINTS_LEFT as APPROACH_LEFT_PATH,
     )
     assert APPROACH_TUCK == TUCK_POSE
     assert APPROACH_RIGHT == RIGHT_TUCK_POSE
+    assert len(APPROACH_LEFT_PATH) == 3
 
 
 def test_right_tuck_is_not_a_naive_mirror_of_the_left():
@@ -110,3 +111,9 @@ def test_right_tuck_is_not_a_naive_mirror_of_the_left():
     ]
     assert RIGHT_TUCK_POSE != mirrored
     assert len(RIGHT_TUCK_POSE) == 7
+
+
+def test_tuck_fold_uses_staged_waypoints():
+    from avaa_solution.grasp_node import TUCK_WAYPOINTS_LEFT, TUCK_WAYPOINT_TIMES
+    assert len(TUCK_WAYPOINTS_LEFT) == len(TUCK_WAYPOINT_TIMES) == 3
+    assert TUCK_WAYPOINTS_LEFT[-1] == TUCK_POSE
