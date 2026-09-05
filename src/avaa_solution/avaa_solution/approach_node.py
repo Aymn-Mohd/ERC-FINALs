@@ -1037,13 +1037,25 @@ class ApproachNode(Node):
             # An outlier gate with no way out turns one bad fix into a permanent one. A
             # run anchored to the wrong book and then rejected the right one 217 times in
             # a row, all at the same 1.24 m, until the approach timed out. Sightings that
-            # disagree with the anchor but agree with each other are the better answer.
+            # disagree with the anchor but agree with each other are the better answer
+            # ONLY when they are still the same bay: column pitch is ~0.96 m, and one run
+            # re-anchored 0.87 m onto the neighbouring column's blue (ended in front of
+            # marker 5 while hunting marker 3). Cap well under half a bay.
             replacement = self._agreeing(self.anchor_disagree)
             if replacement is not None:
+                jump = float(np.linalg.norm(
+                    replacement[:2] - self.target_odom[:2]))
+                if jump > 0.45:
+                    self.get_logger().warn(
+                        "refusing to re-anchor %.2f m away (another column's book); "
+                        "keeping odom [%.2f, %.2f]"
+                        % (jump, self.target_odom[0], self.target_odom[1]),
+                        throttle_duration_sec=3.0)
+                    return False
                 self.get_logger().warn(
                     "re-anchoring: %d sightings agree with each other %.2f m from the "
                     "anchor, so the anchor was wrong"
-                    % (len(self.anchor_disagree), drift))
+                    % (len(self.anchor_disagree), jump))
                 self.target_odom = replacement
                 self.anchor_disagree.clear()
                 return True

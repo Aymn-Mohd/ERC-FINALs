@@ -212,7 +212,35 @@ class PerceptionNode(Node):
             return
 
         anchor = self.locked_book_x if self.locked_book_x is not None else frame.shape[1] / 2.0
-        target = min(candidates, key=lambda b: abs(b.cx - anchor))
+        # Prefer the candidate near the locked image-x whose depth height matches the
+        # locked row. Same-coloured books one bay over often sit on a different row
+        # (this run: marker-3 / row-3 blue vs marker-5 / row-2 blue). Picking by x alone
+        # parked the robot in front of bay 5 while hunting bay 3.
+        expected_z = None
+        if self.reported_row is not None:
+            expected_z = (ROW_HEIGHTS_BASE[self.reported_row - 1] + DEPTH_HEIGHT_BIAS)
+
+        scored = []
+        for book in candidates:
+            px = abs(book.cx - anchor)
+            if (expected_z is not None and self.depth_image is not None
+                    and self.intrinsics is not None):
+                point = dl.locate(book.bbox, self.depth_image, self.intrinsics)
+                if point is not None:
+                    hz = abs(float(point[2]) - expected_z)
+                    # One row is ~0.33 m. Drop books a full shelf away from the locked row.
+                    if hz > 0.22:
+                        continue
+                    scored.append((px + 500.0 * hz, book))
+                    continue
+            scored.append((px, book))
+        if not scored:
+            self.get_logger().warn(
+                f"no {self.book_colour} book matches row {self.reported_row} height "
+                f"({len(candidates)} candidate(s) in view); holding",
+                throttle_duration_sec=5.0)
+            return
+        target = min(scored, key=lambda item: item[0])[1]
 
         # A jump this large is not the target drifting between frames, it is a
         # different book -- e.g. the tracked one left frame and a same-coloured
