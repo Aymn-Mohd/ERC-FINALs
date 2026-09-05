@@ -138,25 +138,14 @@ GRIPPER_CLAMP = -0.0010
 
 DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
-# Folded for driving / MoveIt start. Final pose is PAL's official home; the path to
-# it is staged (see TUCK_WAYPOINTS_*) because a single jump from arms-out swings the
-# elbows through the torso (observed in Gazebo as both arms striking the robot).
+# Folded for driving / MoveIt start — same poses as approach_node (src1 single-point).
 #
-# Source: tiago_pro_bringup/.../tiago_pro_motions_general_straight-wrist.yaml "home"
-TUCK_WAYPOINTS_LEFT = [
-    [1.8557, -1.5919, 0.35538, -2.0502, 0.10524, -1.5976, 0.0],
-    [0.26, -1.6008, 0.3489, -1.9818, 0.0, -1.5829, 0.0],
-    [0.36, -1.83, 0.47, -2.35, 0.0, -1.5463, 0.0],
-]
-TUCK_WAYPOINTS_RIGHT = [
-    [-1.8614, -1.6008, -0.34892, -1.9818, 0.10153, -1.5829, 0.0],
-    [-0.26, -1.6008, -0.3489, -1.9818, 0.0, -1.5829, 0.0],
-    [-0.36, -1.83, -0.47, -2.35, 0.0, -1.5569, 0.0],
-]
-TUCK_WAYPOINT_TIMES = [5.0, 10.0, 15.0]
-TUCK_POSE = TUCK_WAYPOINTS_LEFT[-1]
+# The tuck is an eight-joint posture, torso included. Arms alone with torso down put
+# the wrist through base_link.
+TUCK_POSE = [0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0]
 TUCK_TORSO = 0.10
-RIGHT_TUCK_POSE = TUCK_WAYPOINTS_RIGHT[-1]
+RIGHT_TUCK_POSE = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
+TUCK_TIME_SEC = 5.0
 RIGHT_ARM_JOINTS = [f"arm_right_{i}_joint" for i in range(1, 8)]
 
 # The wrist, in base_link: reach along +x, close the fingers across y. Both come from the
@@ -510,25 +499,21 @@ class GraspNode(Node):
             return None
         return float(sum(abs(a - t) for a, t in zip(actual, TUCK_POSE)))
 
-    def _send_arm_tuck(self, pub, names, waypoints=None, times=None) -> None:
-        """Staged fold onto the controllers (default: PAL home waypoints)."""
-        if waypoints is None:
-            waypoints = (TUCK_WAYPOINTS_LEFT if names == ARM_JOINTS
-                         or list(names) == list(ARM_JOINTS)
-                         else TUCK_WAYPOINTS_RIGHT)
-        if times is None:
-            times = TUCK_WAYPOINT_TIMES
+    def _send_arm_tuck(self, pub, names, pose=None, seconds: float = TUCK_TIME_SEC) -> None:
+        """Single-point fold onto the controllers (src1 style)."""
+        if pose is None:
+            pose = (TUCK_POSE if names == ARM_JOINTS or list(names) == list(ARM_JOINTS)
+                    else RIGHT_TUCK_POSE)
         traj = JointTrajectory()
         traj.joint_names = list(names)
-        for pose, seconds in zip(waypoints, times):
-            point = JointTrajectoryPoint()
-            point.positions = [float(v) for v in pose]
-            point.time_from_start = Duration(
-                sec=int(seconds), nanosec=int((seconds % 1.0) * 1e9))
-            traj.points.append(point)
+        point = JointTrajectoryPoint()
+        point.positions = [float(v) for v in pose]
+        point.time_from_start = Duration(
+            sec=int(seconds), nanosec=int((seconds % 1.0) * 1e9))
+        traj.points = [point]
         pub.publish(traj)
 
-    def _send_torso(self, height: float, seconds: float = 12.0) -> None:
+    def _send_torso(self, height: float, seconds: float = TUCK_TIME_SEC) -> None:
         traj = JointTrajectory()
         traj.joint_names = ["torso_lift_joint"]
         point = JointTrajectoryPoint()
@@ -585,16 +570,15 @@ class GraspNode(Node):
         """
         if not self.safe_tuck_sent:
             self._send_torso(TUCK_TORSO)
-            self._send_arm_tuck(
-                self.pub_arm_left, ARM_JOINTS, TUCK_WAYPOINTS_LEFT)
-            self._send_arm_tuck(
-                self.pub_arm_right, RIGHT_ARM_JOINTS, TUCK_WAYPOINTS_RIGHT)
+            self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
+            self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
             self.safe_tuck_sent = True
-            self.safe_tuck_deadline = self.get_clock().now() + RclDuration(seconds=22.0)
+            self.safe_tuck_deadline = self.get_clock().now() + RclDuration(
+                seconds=TUCK_TIME_SEC + 2.0)
             left = self._left_tuck_gap()
             right = self._right_tuck_gap()
             self.get_logger().info(
-                "folding both arms along PAL home waypoints before planning"
+                "folding both arms to tuck before planning"
                 " (left %.1f rad, right %.1f rad from target)"
                 % (left if left is not None else -1.0,
                    right if right is not None else -1.0))
@@ -1330,10 +1314,8 @@ class GraspNode(Node):
         self.raise_deadline = self.get_clock().now() + RclDuration(seconds=25.0)
         self._send_torso(ideal, seconds=15.0)
         # Hold the final home pose (already folded); do not re-run the full fold path.
-        self._send_arm_tuck(
-            self.pub_arm_left, ARM_JOINTS, [TUCK_POSE], [5.0])
-        self._send_arm_tuck(
-            self.pub_arm_right, RIGHT_ARM_JOINTS, [RIGHT_TUCK_POSE], [5.0])
+        self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
+        self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
         self.get_logger().info(
             "raising torso to %.2f m with arms folded (joint trajectories)" % ideal)
         self._enter(State.RAISE)

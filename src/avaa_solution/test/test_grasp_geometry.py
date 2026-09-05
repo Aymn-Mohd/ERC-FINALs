@@ -13,6 +13,7 @@ from avaa_solution.grasp_node import (
     GRIPPER_OPEN,
     RIGHT_TUCK_POSE,
     TUCK_POSE,
+    TUCK_TORSO,
     row_to_height,
 )
 
@@ -86,34 +87,36 @@ def test_the_tuck_is_not_the_old_self_colliding_one():
 
     [-0.5, -2.4, 0, -2.4, 0, 0, 0] puts arm_left_2 through arm_left_5 against
     torso_base_link and torso_lift_link. Gazebo does not check self-collision so nothing
-    complained, and MoveIt then would not plan from it at all. We now use PAL's home.
+    complained, and MoveIt then would not plan from it at all. We now use the src1
+    compact spherical-wrist home.
     """
     assert TUCK_POSE != [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
     assert len(TUCK_POSE) == 7
-    assert TUCK_POSE == [0.36, -1.83, 0.47, -2.35, 0.0, -1.5463, 0.0]
+    assert TUCK_POSE == [0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0]
 
 
 def test_approach_uses_the_same_collision_free_tuck():
     from avaa_solution.approach_node import (
         RIGHT_TUCK_POSE as APPROACH_RIGHT,
         TUCK_POSE as APPROACH_TUCK,
-        TUCK_WAYPOINTS_LEFT as APPROACH_LEFT_PATH,
+        TUCK_TORSO as APPROACH_TORSO,
     )
     assert APPROACH_TUCK == TUCK_POSE
     assert APPROACH_RIGHT == RIGHT_TUCK_POSE
-    assert len(APPROACH_LEFT_PATH) == 3
+    assert APPROACH_TORSO == TUCK_TORSO
 
 
-def test_right_tuck_is_not_a_naive_mirror_of_the_left():
+def test_right_tuck_mirrors_left_joint_signs():
+    """src1 right tuck is the signed mirror of the left (joints 1 and 3 flipped)."""
     mirrored = [
         -TUCK_POSE[0], TUCK_POSE[1], -TUCK_POSE[2],
         TUCK_POSE[3], TUCK_POSE[4], TUCK_POSE[5], TUCK_POSE[6],
     ]
-    assert RIGHT_TUCK_POSE != mirrored
+    assert RIGHT_TUCK_POSE == mirrored
     assert len(RIGHT_TUCK_POSE) == 7
 
 
-def test_tuck_fold_uses_staged_waypoints():
-    from avaa_solution.grasp_node import TUCK_WAYPOINTS_LEFT, TUCK_WAYPOINT_TIMES
-    assert len(TUCK_WAYPOINTS_LEFT) == len(TUCK_WAYPOINT_TIMES) == 3
-    assert TUCK_WAYPOINTS_LEFT[-1] == TUCK_POSE
+def test_tuck_fold_is_single_point():
+    from avaa_solution.grasp_node import TUCK_TIME_SEC
+    assert TUCK_TIME_SEC == 5.0
+    assert RIGHT_TUCK_POSE == [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]

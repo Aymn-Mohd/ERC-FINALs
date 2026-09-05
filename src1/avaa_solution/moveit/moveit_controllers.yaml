@@ -1,0 +1,36 @@
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - arm_left_controller
+    - torso_controller
+    - gripper_left_controller_raw
+
+  # The arm group spans two controllers, arm and torso, because the torso lift is what
+  # puts the gripper at shelf heights at all. MoveIt splits its trajectory across both.
+  arm_left_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - arm_left_1_joint
+      - arm_left_2_joint
+      - arm_left_3_joint
+      - arm_left_4_joint
+      - arm_left_5_joint
+      - arm_left_6_joint
+      - arm_left_7_joint
+
+  torso_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - torso_lift_joint
+
+  gripper_left_controller_raw:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - gripper_left_finger_joint

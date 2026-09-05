@@ -66,7 +66,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import JointState, LaserScan
+from sensor_msgs.msg import LaserScan
 from builtin_interfaces.msg import Duration
 from std_msgs.msg import Float32, Int32, String
 from tf2_ros import Buffer, TransformListener
@@ -108,10 +108,10 @@ TOPIC_BIN_X = "/avaa/perception/bin_x"
 TOPIC_ODOM = "/odom"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
 TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
+TOPIC_TORSO = "/torso_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
 TOPIC_STATE = "/avaa/approach/state"
 TOPIC_CMD = "/cmd_vel"
-TOPIC_JOINT_STATES = "/joint_states"
 
 SENSOR_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -121,32 +121,18 @@ SENSOR_QOS = QoSProfile(
 )
 
 
-# Arm posture for driving, measured rather than guessed (see try_tuck.py).
+# Arm posture for driving (src1 / tools/tuck_search.py compact fold).
 #
-# The arms spawn with every joint at zero, which for this arm is fully extended: the
-# gripper reaches 0.838 m forward, 0.478 m beyond the front of the base. Driving at the
-# shelf in that posture wedges the arm against it -- observed as six simultaneous contacts
-# between both grippers, both arm_6 links and erc_shelf, with the base unable to advance
-# while the LiDAR still read 0.94 m of clear space ahead. Each contact event costs half a
-# point.
+# The tuck is an eight-joint posture, torso included, and only the eight together
+# are collision free. Commanding the arm alone and leaving the torso down folds
+# arm_left_5, arm_left_6 and the gripper into base_link.
 #
-# PAL official "home" fold from tiago_pro_motions_general_straight-wrist.yaml.
-# A single JointTrajectory point from the spawn pose (arms out) through the torso
-# hits the robot; these staged waypoints lift elbows clear first, then settle.
-TUCK_WAYPOINTS_LEFT = [
-    [1.8557, -1.5919, 0.35538, -2.0502, 0.10524, -1.5976, 0.0],
-    [0.26, -1.6008, 0.3489, -1.9818, 0.0, -1.5829, 0.0],
-    [0.36, -1.83, 0.47, -2.35, 0.0, -1.5463, 0.0],
-]
-TUCK_WAYPOINTS_RIGHT = [
-    [-1.8614, -1.6008, -0.34892, -1.9818, 0.10153, -1.5829, 0.0],
-    [-0.26, -1.6008, -0.3489, -1.9818, 0.0, -1.5829, 0.0],
-    [-0.36, -1.83, -0.47, -2.35, 0.0, -1.5569, 0.0],
-]
-# Seconds from trajectory start for each waypoint (PAL uses 0/5/10; give sim margin).
-TUCK_WAYPOINT_TIMES = [5.0, 10.0, 15.0]
-TUCK_POSE = TUCK_WAYPOINTS_LEFT[-1]
-RIGHT_TUCK_POSE = TUCK_WAYPOINTS_RIGHT[-1]
+# Single-point trajectories to these poses (not staged elbow-high waypoints): the
+# intermediate points swung through the torso. Re-publish only briefly so the
+# spline is not restarted mid-fold.
+TUCK_POSE = [0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0]
+TUCK_TORSO = 0.10
+RIGHT_TUCK = RIGHT_TUCK_POSE = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
 
 
 def wrap_angle(a: float) -> float:
@@ -222,7 +208,7 @@ class ApproachNode(Node):
         # of wall clock. The ordinary state timeout would abort mid-sweep.
         self.declare_parameter("search_timeout_sec", 150.0)
         self.declare_parameter("image_width_px", 640)
-        self.declare_parameter("tuck_time_sec", 18.0)
+        self.declare_parameter("tuck_time_sec", 5.0)
         # Where to stop in front of the collection bin, and whether to go there at all.
         # Picking/placing is not built yet -- this just gets the base into position.
         self.declare_parameter("return_to_bin", True)
@@ -336,13 +322,6 @@ class ApproachNode(Node):
         self.book_hold_time = 3.0
         self.verify_aimed_at: Optional[float] = None
         self.book_held_since: Optional[float] = None
-        # Whether the tuck command has actually gone out (a JointTrajectory published
-        # before the controller has matched the subscription is dropped in silence --
-        # see _send/_do_tuck), and the joint positions it is going to.
-        self.joints: dict = {}
-        self.tuck_sent = False
-        self.tuck_sent_at: Optional[float] = None
-        self.create_subscription(JointState, TOPIC_JOINT_STATES, self._on_joints, 10)
         self.create_subscription(
             PointStamped, TOPIC_BOOK_POINT, self._on_book_point, 10)
         self.create_subscription(Float32, TOPIC_BIN_X, self._on_bin_x, 10)
@@ -358,6 +337,7 @@ class ApproachNode(Node):
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
         self.pub_arm_left = self.create_publisher(JointTrajectory, TOPIC_ARM_LEFT, 10)
         self.pub_arm_right = self.create_publisher(JointTrajectory, TOPIC_ARM_RIGHT, 10)
+        self.pub_torso = self.create_publisher(JointTrajectory, TOPIC_TORSO, 10)
 
         self.create_timer(0.1, self._tick)
         self.get_logger().info(
@@ -402,10 +382,6 @@ class ApproachNode(Node):
         p = msg.pose.pose.position
         yaw = yaw_from_quat(msg.pose.pose.orientation)
         self.odom_pose = (p.x, p.y, yaw)
-
-    def _on_joints(self, msg: JointState) -> None:
-        for name, position in zip(msg.name, msg.position):
-            self.joints[name] = position
 
     def _on_scan(self, msg: LaserScan) -> None:
         self.scan = msg
@@ -533,9 +509,6 @@ class ApproachNode(Node):
             self.target_odom = None
             self.anchor_candidates.clear()
             self.anchor_disagree.clear()
-        if state is State.TUCK:
-            self.tuck_sent = False
-            self.tuck_sent_at = None
         if state is State.BIN_SEARCH:
             self.bin_head_levelled = False
         if state is State.FACE_BIN:
@@ -643,9 +616,7 @@ class ApproachNode(Node):
         retry only when nothing was listening. Re-sending a command that did arrive is
         worse than not sending it -- each new JointTrajectory replaces the one in
         progress and restarts its time_from_start, so a trajectory re-sent on a timer
-        never finishes. That was the actual cause of the jittery startup tuck: several
-        resends landed in the controller's first half-second, each yanking the arm back
-        to the start of the spline.
+        never finishes.
         """
         if pub.get_subscription_count() == 0:
             self.get_logger().warn(
@@ -662,81 +633,40 @@ class ApproachNode(Node):
         pub.publish(traj)
         return True
 
-    def _send_waypoints(self, pub, names: List[str],
-                        waypoints: List[List[float]], times: List[float]) -> bool:
-        """Publish a multi-point JointTrajectory (for a staged fold that clears the body)."""
-        if pub.get_subscription_count() == 0:
-            self.get_logger().warn(
-                f"nothing is listening on {pub.topic_name} yet; holding the command",
-                throttle_duration_sec=2.0)
-            return False
-        traj = JointTrajectory()
-        traj.joint_names = list(names)
-        for pose, seconds in zip(waypoints, times):
+    def _send_tuck(self) -> None:
+        """Command both arms and the torso to the driving posture (src1 single-point)."""
+        for pub, side in ((self.pub_arm_left, "left"), (self.pub_arm_right, "right")):
+            traj = JointTrajectory()
+            traj.joint_names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
             point = JointTrajectoryPoint()
+            pose = list(RIGHT_TUCK) if side == "right" else list(TUCK_POSE)
             point.positions = [float(v) for v in pose]
-            point.time_from_start = Duration(
-                sec=int(seconds), nanosec=int((seconds % 1.0) * 1e9))
-            traj.points.append(point)
-        pub.publish(traj)
-        return True
+            point.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
+            traj.points = [point]
+            pub.publish(traj)
 
-    def _send_tuck(self) -> bool:
-        """Command both arms along the PAL home fold (staged, not one jump).
-
-        Only once something is listening on both controllers. Returns whether both
-        commands actually went out this call.
-        """
-        ok = True
-        for pub, side, waypoints in (
-                (self.pub_arm_left, "left", TUCK_WAYPOINTS_LEFT),
-                (self.pub_arm_right, "right", TUCK_WAYPOINTS_RIGHT)):
-            names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
-            ok = self._send_waypoints(
-                pub, names, waypoints, TUCK_WAYPOINT_TIMES) and ok
-        if ok:
-            self.get_logger().info(
-                "stowing arms for driving (PAL home fold, %d waypoints)"
-                % len(TUCK_WAYPOINTS_LEFT))
-        return ok
-
-    def _tuck_gap(self) -> Optional[float]:
-        """Sum the joint-space distance from the tuck target.
-
-        Returns None until every joint the tuck touches has reported at least once.
-        """
-        names = ([f"arm_left_{i}_joint" for i in range(1, 8)]
-                 + [f"arm_right_{i}_joint" for i in range(1, 8)])
-        targets = list(TUCK_POSE) + list(RIGHT_TUCK_POSE)
-        try:
-            actual = [self.joints[name] for name in names]
-        except KeyError:
-            return None
-        return float(sum(abs(a - t) for a, t in zip(actual, targets)))
+        # Torso with them, or the folded arm sits inside the base.
+        torso = JointTrajectory()
+        torso.joint_names = ["torso_lift_joint"]
+        lift = JointTrajectoryPoint()
+        lift.positions = [float(TUCK_TORSO)]
+        lift.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
+        torso.points = [lift]
+        self.pub_torso.publish(torso)
+        self.get_logger().info("stowing arms for driving")
 
     def _do_tuck(self) -> None:
         self._stop()  # no driving until the arms are in
+        elapsed = self._now() - self.state_since
 
-        if not self.tuck_sent:
-            self.tuck_sent = self._send_tuck()
-            if self.tuck_sent:
-                self.tuck_sent_at = self._now()
+        # Repeat only during the first moment, to cover the controller not yet being
+        # subscribed. Repeating later is actively harmful: each JointTrajectory replaces
+        # the one in progress and restarts its time_from_start, so a trajectory re-sent
+        # every two seconds never finishes.
+        if elapsed < 0.6:
+            self._send_tuck()
 
-        # Verify arrival from /joint_states rather than assuming the trajectory was
-        # followed -- grasp_node measured this arm taking about three times the
-        # commanded time_from_start to actually get there. tools/tuck_arm.py's own
-        # check (sum of joint-space error, warn past 0.5 rad) is mirrored here.
-        if self.tuck_sent:
-            gap = self._tuck_gap()
-            if gap is not None and gap <= 0.5:
-                self._enter(State.SEARCH)
-                return
-
-        # Don't wait forever if the tuck is never confirmed -- proceed anyway rather
-        # than stall the whole run over a simulation hiccup.
-        if self._elapsed() >= self.tuck_time + 5.0:
-            self.get_logger().warn(
-                "tuck not confirmed via /joint_states in time; proceeding anyway")
+        if elapsed >= self.tuck_time + 2.0:
             self._enter(State.SEARCH)
 
     def _do_search(self) -> None:

@@ -1,0 +1,270 @@
+# Nav2 configuration for Team AVAA, ERC 2026.
+#
+# Deliberately map-less and localisation-less. Everything runs in the `odom` frame with
+# rolling costmaps:
+#
+#   * There is no prior map, and the robot's start pose is not guaranteed, so AMCL would
+#     have nothing to localise against.
+#   * A single trial is short and travels a few metres, so odometry drift over the run is
+#     far smaller than the clearances involved.
+#   * SLAM would add CPU load we cannot afford -- the simulation already runs at a
+#     real-time factor of ~0.35, and the physical robot is an i5 with no GPU.
+#
+# Frames therefore use `odom` as the global frame throughout. Costmaps roll with the robot
+# and are built from the two LiDARs, which is enough for the obstacle set here (shelf unit,
+# table, bin, four walls).
+
+bt_navigator:
+  ros__parameters:
+    global_frame: odom
+    robot_base_frame: base_footprint
+    odom_topic: /odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+
+controller_server:
+  ros__parameters:
+    # 5 Hz rather than the default 20. The simulation runs at RTF ~0.35 and the
+    # controller competes with Gazebo for the same cores; at 10 Hz it logged
+    # "Control loop missed its desired rate" continuously, which makes the robot creep
+    # and then trip the progress checker.
+    controller_frequency: 5.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: progress_checker
+    goal_checker_plugins: [general_goal_checker]
+    controller_plugins: [FollowPath]
+
+    progress_checker:
+      plugin: nav2_controller::SimpleProgressChecker
+      # 0.2 m, not the 0.5 m default. The checker demands this much movement within the
+      # allowance or it aborts -- but on the final approach there may be less than that
+      # left to travel, so a large radius guarantees an abort just short of the goal.
+      # Observed exactly that: stalled 0.235 m out with "Failed to make progress".
+      required_movement_radius: 0.2
+      movement_time_allowance: 30.0
+
+    general_goal_checker:
+      plugin: nav2_controller::SimpleGoalChecker
+      stateful: true
+      # DELIBERATELY LOOSE, and this is the single most important number in the file.
+      #
+      # DWB reliably drives to within roughly 0.3 m of the goal and then stops dead. It
+      # was measured travelling 0.779 m of a 1.0 m goal on three consecutive runs -- the
+      # same distance every time, independent of how far the goal was, and with zero
+      # control-loop rate misses, so it is not a CPU problem. Below about 0.3 m it emits
+      # zero velocity and eventually aborts with "Failed to make progress".
+      #
+      # At 0.15 m every goal failed. At 0.35 m the same goal completed in 3.9 s with a
+      # final error of 0.305 m.
+      #
+      # Nav2 therefore does gross navigation only. Final positioning within arm's reach is
+      # a separate short approach step driven by the camera and LiDAR -- which mobile
+      # manipulation needs regardless, since the arm has to be placed relative to the book
+      # rather than to an odometry coordinate.
+      xy_goal_tolerance: 0.35
+      yaw_goal_tolerance: 0.30
+
+    FollowPath:
+      plugin: dwb_core::DWBLocalPlanner
+      debug_trajectory_details: true
+      # Lateral motion is disabled here, but the original reason turned out to be wrong
+      # and this should be revisited.
+      #
+      # It was disabled after measuring a large yaw coupling on pure lateral commands:
+      #     vy=+0.20 -> dy=+0.225 m, dyaw=-0.300 rad
+      #     vy=+0.20 -> dy=+0.116 m, dyaw=-0.117 rad   (repeat run)
+      # With strafing enabled DWB chased that error; an in-place rotation goal ended with
+      # the robot 1.3 m from where it started.
+      #
+      # THE COUPLING WAS THE ARMS, NOT THE BASE. Those runs were made with the arms in
+      # their spawn pose, fully extended 0.48 m beyond the front of the base -- and in
+      # some of them actually in contact with the shelf. Repeating the same measurement
+      # with the arms tucked:
+      #     vy=+0.20 -> dy=+0.211 m, dyaw=-0.000 rad
+      #     vx=+0.20 -> dx=+0.229 m, dy=+0.000 m, dyaw=-0.000 rad
+      #     wz=+0.40 -> dx=-0.000 m, dy=-0.000 m, dyaw=+0.446 rad
+      # Clean on all three axes.
+      #
+      # So the mecanum base is properly decoupled provided the arms are stowed, and
+      # re-enabling vy should shorten the approach -- completion time is the tie-breaker.
+      # Left disabled only because it has not yet been re-tested end to end with the tuck
+      # in place; enabling it is a change to make deliberately, with a measurement.
+      #
+      # See approach_node.TUCK_POSE for the stowed configuration.
+      # Sample counts kept low: every extra trajectory is CPU the simulation needs.
+      vx_samples: 10
+      vy_samples: 1
+      vtheta_samples: 12
+      min_vel_x: -0.26
+      max_vel_x: 0.50
+      min_vel_y: 0.0
+      max_vel_y: 0.0
+      max_vel_theta: 1.0
+      min_speed_xy: 0.0
+      max_speed_xy: 0.50
+      min_speed_theta: 0.0
+      acc_lim_x: 1.0
+      acc_lim_y: 1.0
+      acc_lim_theta: 2.0
+      decel_lim_x: -1.5
+      decel_lim_y: -1.5
+      decel_lim_theta: -2.5
+      sim_time: 1.5
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.5
+      trans_stopped_velocity: 0.25
+      short_circuit_trajectory_evaluation: true
+      stateful: true
+      # Oscillation is deliberately absent. It latches out a direction once it believes
+      # the robot is oscillating and does not clear until the robot moves a set distance
+      # -- which it cannot do while the critic is suppressing the only motion that would
+      # achieve it. With DWB commanding zero velocity mid-approach and then aborting on
+      # the progress checker, this was the first suspect.
+      critics: [RotateToGoal, BaseObstacle, GoalAlign, PathAlign, PathDist, GoalDist]
+      BaseObstacle.scale: 0.05
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.15
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.15
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 4.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_footprint
+      rolling_window: true
+      width: 5
+      height: 5
+      resolution: 0.05
+      # Rectangular, not a circle. The base is 0.717 x 0.497 m; a circumscribed circle
+      # of radius 0.44 m would keep the robot too far from the shelf for the arm to reach.
+      footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
+      plugins: [obstacle_layer, inflation_layer]
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: front_scan rear_scan
+        front_scan:
+          topic: /scan_front_raw
+          sensor_frame: base_front_laser_link
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          max_obstacle_height: 2.0
+          obstacle_max_range: 6.0
+          raytrace_max_range: 8.0
+        rear_scan:
+          topic: /scan_rear_raw
+          sensor_frame: base_rear_laser_link
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          max_obstacle_height: 2.0
+          obstacle_max_range: 6.0
+          raytrace_max_range: 8.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        # Modest inflation: the arena is tight and an over-inflated shelf would leave no
+        # admissible pose within arm's reach of the books.
+        inflation_radius: 0.35
+        cost_scaling_factor: 3.0
+      always_send_full_costmap: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      global_frame: odom
+      robot_base_frame: base_footprint
+      # Rolling, because there is no static map to anchor to.
+      rolling_window: true
+      width: 16
+      height: 16
+      resolution: 0.05
+      footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
+      plugins: [obstacle_layer, inflation_layer]
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: front_scan rear_scan
+        front_scan:
+          topic: /scan_front_raw
+          sensor_frame: base_front_laser_link
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          max_obstacle_height: 2.0
+          obstacle_max_range: 8.0
+          raytrace_max_range: 10.0
+        rear_scan:
+          topic: /scan_rear_raw
+          sensor_frame: base_rear_laser_link
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          max_obstacle_height: 2.0
+          obstacle_max_range: 8.0
+          raytrace_max_range: 10.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        inflation_radius: 0.35
+        cost_scaling_factor: 3.0
+      always_send_full_costmap: true
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 5.0
+    planner_plugins: [GridBased]
+    GridBased:
+      plugin: nav2_navfn_planner/NavfnPlanner
+      tolerance: 0.15
+      use_astar: true
+      allow_unknown: true
+
+behavior_server:
+  ros__parameters:
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: [spin, backup, wait]
+    spin:
+      plugin: nav2_behaviors/Spin
+    backup:
+      plugin: nav2_behaviors/BackUp
+    wait:
+      plugin: nav2_behaviors/Wait
+    local_frame: odom
+    global_frame: odom
+    robot_base_frame: base_footprint
+    transform_tolerance: 0.3
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 0.8
+    min_rotational_vel: 0.2
+    rotational_acc_lim: 2.0
+
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 10.0
+    scale_velocities: false
+    feedback: OPEN_LOOP
+    # y held at zero to match the controller: see the note on lateral coupling above.
+    max_velocity: [0.50, 0.0, 1.0]
+    min_velocity: [-0.26, 0.0, -1.0]
+    max_accel: [1.0, 1.0, 2.0]
+    max_decel: [-1.5, -1.5, -2.5]
+    odom_topic: /odom
+    odom_duration: 0.1
