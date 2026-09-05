@@ -46,7 +46,7 @@ from moveit_msgs.srv import (ApplyPlanningScene, GetCartesianPath,
                              GetStateValidity)
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from builtin_interfaces.msg import Duration
 from shape_msgs.msg import SolidPrimitive
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -123,8 +123,18 @@ class MoveItClient:
         self.last_failure = ""
         self._executor = MultiThreadedExecutor(num_threads=4)
         self._executor.add_node(self.node)
-        self._thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
+
+    def _spin(self) -> None:
+        """Background spin; exit quietly when launch / Ctrl-C tears the context down."""
+        try:
+            self._executor.spin()
+        except ExternalShutdownException:
+            pass
+        except Exception:  # noqa: BLE001 - wait-set errors after rcl_shutdown
+            if rclpy.ok():
+                raise
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -136,8 +146,16 @@ class MoveItClient:
                 and self.validity.wait_for_service(timeout_sec=timeout))
 
     def shutdown(self) -> None:
-        self._executor.shutdown()
-        self.node.destroy_node()
+        try:
+            self._executor.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        try:
+            self.node.destroy_node()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------ the scene
 

@@ -258,13 +258,11 @@ class GraspNode(Node):
         # and pushes -- and a third of a newton is nothing, so the book goes over before
         # the second pad arrives. Every failed run ended with it tipped, not slipped.
         #
-        # 45 mm rather than the 80 that the arithmetic wants. At 80 the arm simply
-        # cannot get there: twelve pre-grasp postures in a row came back with no IK
-        # solution at all, none of them in collision and none over torque, so it is
-        # reach and not clutter that runs out. 45 mm still lifts the tipping threshold
-        # from 0.35 N to about 0.55 N, and the pads are 34 mm tall so it stays clear of
-        # the shelf board the book stands on.
-        self.declare_parameter("grasp_below_centre_m", 0.045)
+        # 20 mm rather than 45. At 45 the tip sat on the shelf lip on the bottom row
+        # (row 4 at z=0.356) and the wrist scraped the board on the way in. 20 mm still
+        # lowers the tipping lever vs mid-height, and the pads clear the board the book
+        # stands on. Asked: raise the final grasp a bit.
+        self.declare_parameter("grasp_below_centre_m", 0.020)
         # How still the book has to look, and for how long, before the jaws close.
         self.declare_parameter("quiet_spread_m", 0.004)
         self.declare_parameter("quiet_for_sec", 2.5)
@@ -1113,7 +1111,16 @@ class GraspNode(Node):
             # Mild: keep the elbow off its stops, which is where it sags onto.
             crowding = sum(max(0.0, 0.20 - min(v - lo, hi - v))
                            for v, (lo, hi) in zip(values, self.chain.limits))
-            return 10.0 * torso + crowding
+            # Keep the elbow out of the shelf board above the target row. High-elbow
+            # solutions reach the tip but jam the forearm under the next board on the
+            # way in (last run: obstructed 25% into the final 78 mm).
+            high_elbow = 0.0
+            try:
+                elbow_z = float(self.chain.joint_origins(values)[4][2])
+                high_elbow = max(0.0, elbow_z - (height + 0.08))
+            except (IndexError, ValueError, TypeError):
+                pass
+            return 10.0 * torso + crowding + 25.0 * high_elbow
 
         return cost
 
@@ -1227,6 +1234,45 @@ class GraspNode(Node):
             waypoints.append(solution)
             seed = solution
         return waypoints
+
+    def _shelf_entry_path(self, start_solution, start_point, end_point):
+        """Straight reach with a short lift / back-off if the direct line hits a board.
+
+        Used when the tip is already on the shelf lip: backing out a few centimetres and
+        lifting clears the wrist under the board above, then the same bay is reachable.
+        Returns waypoints, or None. Does not rewrite grasp_target — the caller decides.
+        """
+        start_point = np.asarray(start_point, dtype=float)
+        end_point = np.asarray(end_point, dtype=float)
+        back = start_point.copy()
+        back[0] -= 0.04
+        lifted = end_point.copy()
+        lifted[2] += 0.025
+        via = np.array([back[0], back[1], lifted[2]], dtype=float)
+
+        mid = self.chain.ik(
+            via, seed=list(start_solution), approach=GRASP_APPROACH,
+            closing=GRASP_CLOSING, pin=self._torso_for(float(via[2])))
+        if mid is None or not self._clear(mid):
+            mid = self.chain.ik(
+                back, seed=list(start_solution), approach=GRASP_APPROACH,
+                closing=GRASP_CLOSING, pin=self._torso_for(float(back[2])))
+            if mid is None or not self._clear(mid):
+                return None
+            via = back
+
+        first = self._straight_path(start_solution, start_point, via, steps=3)
+        if first is None:
+            return None
+        second = self._straight_path(first[-1], via, lifted, steps=4)
+        if second is None:
+            second = self._straight_path(first[-1], via, end_point, steps=4)
+            if second is None:
+                return None
+        else:
+            self.get_logger().info(
+                "entry line cleared by backing off and lifting the tip 25 mm")
+        return list(first) + list(second[1:])
 
     def _add_shelf(self) -> bool:
         """Describe the shelf to the planner, as boards rather than as a block.
@@ -1554,8 +1600,44 @@ class GraspNode(Node):
                 self.get_logger().error("cannot see the arm to aim the last stretch")
                 self._enter(State.FAILED)
                 return
-            remaining = float(np.linalg.norm(np.asarray(self.grasp_target) - here))
-            final = self._straight_path(start, here, self.grasp_target, steps=4)
+            goal = np.asarray(self.grasp_target, dtype=float)
+            remaining = float(np.linalg.norm(goal - here))
+            # The controller often finishes the first leg short (measured: 78 mm still
+            # out with 0.45 rad of joint lag). Treating that as the "last 35 mm" and
+            # diving in with four IK steps is what jammed the wrist under the shelf
+            # board above. Close to the mouth again first; only then do the tip-in.
+            if remaining > self.final_approach + 0.03:
+                span = goal - here
+                reach = float(np.linalg.norm(span))
+                mouth = goal - (self.final_approach / reach) * span
+                path = self._straight_path(start, here, mouth, steps=6)
+                if path is None:
+                    path = self._shelf_entry_path(start, here, mouth)
+                if path is None:
+                    self.get_logger().error(
+                        "still %.0f mm short of the book and cannot close to the mouth"
+                        % (remaining * 1000))
+                    self._enter(State.FAILED)
+                    return
+                self.leg_target = mouth
+                self.reach_path = path
+                duration = self._send_chain_waypoints(path)
+                self.advance_deadline = self.get_clock().now() + RclDuration(
+                    seconds=float(duration + 8.0))
+                self.get_logger().info(
+                    "first leg finished short (%.0f mm left, drift %.0f mm); "
+                    "closing to the mouth again before the tip-in"
+                    % (remaining * 1000, drifted * 1000))
+                return
+
+            final = self._straight_path(start, here, goal, steps=4)
+            if final is None:
+                final = self._shelf_entry_path(start, here, goal)
+                if final is not None:
+                    tip = np.asarray(
+                        self.chain.fk(list(final[-1]))[:3, 3], dtype=float)
+                    self.grasp_target = tip
+                    goal = tip
             if final is None:
                 self.get_logger().error(
                     "no clear line for the last %.0f mm" % (remaining * 1000))
@@ -1567,9 +1649,8 @@ class GraspNode(Node):
             self.advance_deadline = self.get_clock().now() + RclDuration(
                 seconds=float(duration + 8.0))
             self.get_logger().info(
-                "at the staging point; the book moved %.0f mm while I reached, "
-                "closing the last %.0f mm via IK (%.1f s)"
-                % (drifted * 1000, remaining * 1000, duration))
+                "last stretch: %.0f mm to go (target moved %.0f mm while arriving)"
+                % (float(np.linalg.norm(goal - here)) * 1000, drifted * 1000))
             return
 
         # Wait for the base to go quiet before closing.
@@ -1798,9 +1879,15 @@ def main(args=None) -> None:
             node.moveit.shutdown()
         except Exception:  # noqa: BLE001
             pass
-        node.destroy_node()
+        try:
+            node.destroy_node()
+        except Exception:  # noqa: BLE001
+            pass
         if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":
