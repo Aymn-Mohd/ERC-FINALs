@@ -86,15 +86,17 @@ ODOM_FRAME = "odom"
 SHOULDER_OFFSET_Y = 0.159
 CAMERA_FRAME = "head_front_camera_depth_optical_frame"
 
-# base_link sits this far above base_footprint. Row heights are quoted in base_link.
-BASE_LINK_Z = 0.186
+# base_link sits this far above base_footprint (wheel_radius, tiago_pro.urdf
+# base_footprint_joint). Row heights are quoted in base_link.
+BASE_LINK_Z = 0.0762
 
 # head_2_joint: negative looks down, roughly one-for-one in radians. Limits from the URDF.
 HEAD_TILT_MIN = -1.047   # about 60 degrees down
 HEAD_TILT_MAX = 0.349    # about 20 degrees up
 
-# Gripper z in base_link for rows 1..4, top shelf first.
-DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
+# Book centre z in base_link for rows 1..4, top shelf first. Same table as grasp_node
+# (settled book centres from the spawn heights in erc_bringup, minus BASE_LINK_Z).
+DEFAULT_ROW_HEIGHTS = [1.501, 1.171, 0.841, 0.511]
 
 # Scan returns inside this radius of base_footprint are the robot itself, not obstacles.
 # The base is 0.717 x 0.497 m, so its circumscribed radius is 0.437 m; this sits just
@@ -1037,25 +1039,13 @@ class ApproachNode(Node):
             # An outlier gate with no way out turns one bad fix into a permanent one. A
             # run anchored to the wrong book and then rejected the right one 217 times in
             # a row, all at the same 1.24 m, until the approach timed out. Sightings that
-            # disagree with the anchor but agree with each other are the better answer
-            # ONLY when they are still the same bay: column pitch is ~0.96 m, and one run
-            # re-anchored 0.87 m onto the neighbouring column's blue (ended in front of
-            # marker 5 while hunting marker 3). Cap well under half a bay.
+            # disagree with the anchor but agree with each other are the better answer.
             replacement = self._agreeing(self.anchor_disagree)
             if replacement is not None:
-                jump = float(np.linalg.norm(
-                    replacement[:2] - self.target_odom[:2]))
-                if jump > 0.45:
-                    self.get_logger().warn(
-                        "refusing to re-anchor %.2f m away (another column's book); "
-                        "keeping odom [%.2f, %.2f]"
-                        % (jump, self.target_odom[0], self.target_odom[1]),
-                        throttle_duration_sec=3.0)
-                    return False
                 self.get_logger().warn(
                     "re-anchoring: %d sightings agree with each other %.2f m from the "
                     "anchor, so the anchor was wrong"
-                    % (len(self.anchor_disagree), jump))
+                    % (len(self.anchor_disagree), drift))
                 self.target_odom = replacement
                 self.anchor_disagree.clear()
                 return True

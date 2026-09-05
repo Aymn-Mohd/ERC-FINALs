@@ -17,7 +17,7 @@ from avaa_solution.grasp_node import (
     row_to_height,
 )
 
-HEIGHTS = [1.391, 1.061, 0.731, 0.401]   # top shelf first
+HEIGHTS = [1.501, 1.171, 0.841, 0.511]   # book centres in base_link, top shelf first
 
 
 def test_defaults_are_ordered_top_shelf_first():
@@ -30,12 +30,22 @@ def test_rows_are_evenly_spaced():
         assert gap == pytest.approx(0.33, abs=0.005)
 
 
-@pytest.mark.parametrize("row,expected", [(1, 1.391), (2, 1.061), (3, 0.731), (4, 0.401)])
+@pytest.mark.parametrize("row,expected", [(1, 1.501), (2, 1.171), (3, 0.841), (4, 0.511)])
 def test_top_down_numbering(row, expected):
     assert row_to_height(row, HEIGHTS, top_down=True) == pytest.approx(expected)
 
 
-@pytest.mark.parametrize("row,expected", [(1, 0.401), (2, 0.731), (3, 1.061), (4, 1.391)])
+def test_row_heights_are_book_centres_in_base_link():
+    """Spawn z from erc_bringup (1.1 + 0.825 - 0.33*row), settled ~18 mm, minus the
+    0.0762 base_footprint -> base_link offset. Not the shelf board."""
+    base_link_z = 0.0762
+    settle = 0.018
+    for row, height in zip(range(1, 5), DEFAULT_ROW_HEIGHTS):
+        world_centre = 1.1 + 0.825 - 0.33 * row - settle
+        assert height == pytest.approx(world_centre - base_link_z, abs=0.002)
+
+
+@pytest.mark.parametrize("row,expected", [(1, 0.511), (2, 0.841), (3, 1.171), (4, 1.501)])
 def test_bottom_up_numbering(row, expected):
     assert row_to_height(row, HEIGHTS, top_down=False) == pytest.approx(expected)
 

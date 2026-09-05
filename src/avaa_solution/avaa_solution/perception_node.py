@@ -56,18 +56,16 @@ TOPIC_TARGET_BOOK_POINT = "/avaa/perception/target_book_point"
 # Where the grasp controller wants the book expressed.
 GRASP_FRAME = "base_link"
 
-# Shelf heights in base_link, top row first, and how far the deprojected height sits
-# above the truth. Measured against Gazebo over 100 published points: +152 mm at 0.7-0.9 m
-# with 41 mm of spread, +193 at 0.9-1.2, +146 at 1.2-1.6, +121 beyond. The bias is not
-# constant enough to name a row on its own -- 0.6 of a row spacing at worst -- but it is
-# nowhere near the 660 mm needed to confuse rows two apart, which is what makes it a
-# usable check on an answer arrived at a completely different way.
+# Book centre heights in base_link, top row first, and how far the deprojected height
+# sits above the truth.
 #
-# ASSUMPTION: the bias comes from the bounding box sitting high on the visible face of a
-# book whose lower edge is occluded by the shelf lip. It is treated as a constant here
-# because it does not need to be better than half a row to do this job.
-ROW_HEIGHTS_BASE = [1.391, 1.061, 0.731, 0.401]
-DEPTH_HEIGHT_BIAS = 0.152
+# The old table [1.391, 1.061, 0.731, 0.401] assumed base_link 0.186 m above the floor;
+# it is 0.0762 (wheel radius), so those were the shelf boards, 110 mm under the book
+# centres. The "+152 mm bias" measured against that table was mostly the table: against
+# the real centres the deprojected height reads about +42 mm high (the box takes in the
+# top face of the book from a camera looking down). expected_z below is unchanged.
+ROW_HEIGHTS_BASE = [1.501, 1.171, 0.841, 0.511]
+DEPTH_HEIGHT_BIAS = 0.042
 
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
@@ -213,10 +211,9 @@ class PerceptionNode(Node):
 
         anchor = self.locked_book_x if self.locked_book_x is not None else frame.shape[1] / 2.0
         # Prefer the candidate near the locked image-x whose depth height matches the
-        # locked row. Same-coloured books one bay over often sit on a different row.
-        # Soft score only -- a hard height gate starved ACQUIRE of bearings when depth
-        # bias put the true row-4 book just outside 0.22 m ("no blue book matches row 4
-        # height (3 candidate(s)); holding").
+        # locked row. Same-coloured books one bay over often sit on a different row
+        # (this run: marker-3 / row-3 blue vs marker-5 / row-2 blue). Picking by x alone
+        # parked the robot in front of bay 5 while hunting bay 3.
         expected_z = None
         if self.reported_row is not None:
             expected_z = (ROW_HEIGHTS_BASE[self.reported_row - 1] + DEPTH_HEIGHT_BIAS)
@@ -224,14 +221,23 @@ class PerceptionNode(Node):
         scored = []
         for book in candidates:
             px = abs(book.cx - anchor)
-            hz_penalty = 0.0
             if (expected_z is not None and self.depth_image is not None
                     and self.intrinsics is not None):
                 point = dl.locate(book.bbox, self.depth_image, self.intrinsics)
                 if point is not None:
-                    # ~0.33 m per row. Penalise, but never drop: approach needs a bearing.
-                    hz_penalty = 800.0 * abs(float(point[2]) - expected_z)
-            scored.append((px + hz_penalty, book))
+                    hz = abs(float(point[2]) - expected_z)
+                    # One row is ~0.33 m. Drop books a full shelf away from the locked row.
+                    if hz > 0.22:
+                        continue
+                    scored.append((px + 500.0 * hz, book))
+                    continue
+            scored.append((px, book))
+        if not scored:
+            self.get_logger().warn(
+                f"no {self.book_colour} book matches row {self.reported_row} height "
+                f"({len(candidates)} candidate(s) in view); holding",
+                throttle_duration_sec=5.0)
+            return
         target = min(scored, key=lambda item: item[0])[1]
 
         # A jump this large is not the target drifting between frames, it is a
