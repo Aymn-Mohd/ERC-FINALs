@@ -136,10 +136,7 @@ GRIPPER_OPEN_MIN = 0.044
 #                             topples after 78 mm
 GRIPPER_CLAMP = -0.0010
 
-# Book centre heights in base_link, top row first. These must match
-# perception_node.ROW_HEIGHTS_BASE. The old values were shelf-board heights,
-# 110 mm below the book centres.
-DEFAULT_ROW_HEIGHTS = [1.501, 1.171, 0.841, 0.511]
+DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
 # Folded for driving / MoveIt start — same poses as approach_node (src1 single-point).
 #
@@ -261,10 +258,13 @@ class GraspNode(Node):
         # and pushes -- and a third of a newton is nothing, so the book goes over before
         # the second pad arrives. Every failed run ended with it tipped, not slipped.
         #
-        # Aim at the actual centre. The former row table was already 110 mm too low,
-        # then this offset removed another 20 mm; row 3 consequently targeted z=0.711
-        # instead of the true centre at z=0.841 and passed below the blue book.
-        self.declare_parameter("grasp_below_centre_m", 0.0)
+        # 45 mm rather than the 80 that the arithmetic wants. At 80 the arm simply
+        # cannot get there: twelve pre-grasp postures in a row came back with no IK
+        # solution at all, none of them in collision and none over torque, so it is
+        # reach and not clutter that runs out. 45 mm still lifts the tipping threshold
+        # from 0.35 N to about 0.55 N, and the pads are 34 mm tall so it stays clear of
+        # the shelf board the book stands on.
+        self.declare_parameter("grasp_below_centre_m", 0.045)
         # How still the book has to look, and for how long, before the jaws close.
         self.declare_parameter("quiet_spread_m", 0.004)
         self.declare_parameter("quiet_for_sec", 2.5)
@@ -1881,15 +1881,9 @@ def main(args=None) -> None:
             node.moveit.shutdown()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            node.destroy_node()
-        except Exception:  # noqa: BLE001
-            pass
+        node.destroy_node()
         if rclpy.ok():
-            try:
-                rclpy.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

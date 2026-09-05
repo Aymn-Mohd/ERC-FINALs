@@ -94,9 +94,7 @@ HEAD_TILT_MIN = -1.047   # about 60 degrees down
 HEAD_TILT_MAX = 0.349    # about 20 degrees up
 
 # Gripper z in base_link for rows 1..4, top shelf first.
-# Book centre heights in base_link, top row first. Keep aligned with perception and
-# grasp; the older table described the shelf boards and aimed the head 110 mm low.
-DEFAULT_ROW_HEIGHTS = [1.501, 1.171, 0.841, 0.511]
+DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
 # Scan returns inside this radius of base_footprint are the robot itself, not obstacles.
 # The base is 0.717 x 0.497 m, so its circumscribed radius is 0.437 m; this sits just
