@@ -66,7 +66,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import JointState, LaserScan
 from builtin_interfaces.msg import Duration
 from std_msgs.msg import Float32, Int32, String
 from tf2_ros import Buffer, TransformListener
@@ -112,6 +112,7 @@ TOPIC_TORSO = "/torso_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
 TOPIC_STATE = "/avaa/approach/state"
 TOPIC_CMD = "/cmd_vel"
+TOPIC_JOINT_STATES = "/joint_states"
 
 SENSOR_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -121,18 +122,12 @@ SENSOR_QOS = QoSProfile(
 )
 
 
-# Arm posture for driving (src1 / tools/tuck_search.py compact fold).
-#
-# The tuck is an eight-joint posture, torso included, and only the eight together
-# are collision free. Commanding the arm alone and leaving the torso down folds
-# arm_left_5, arm_left_6 and the gripper into base_link.
-#
-# Single-point trajectories to these poses (not staged elbow-high waypoints): the
-# intermediate points swung through the torso. Re-publish only briefly so the
-# spline is not restarted mid-fold.
+# Collision-free compact driving posture from src1. The torso is part of the tuck:
+# folding the arms to these angles while leaving the torso down puts wrist links into
+# base_link.
 TUCK_POSE = [0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0]
+RIGHT_TUCK = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
 TUCK_TORSO = 0.10
-RIGHT_TUCK = RIGHT_TUCK_POSE = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
 
 
 def wrap_angle(a: float) -> float:
@@ -177,11 +172,7 @@ class ApproachNode(Node):
         # envelope, which cannot be settled until grasping exists.
         self.declare_parameter("standoff_m", 0.75)
         self.declare_parameter("centre_tolerance_px", 12.0)
-        # 0.10 rather than 0.05: the final drive was measured stalling at ahead≈0.82–0.88
-        # with remaining 0.07–0.13 while vy fought a few centimetres of lateral error and
-        # the base slid back along x. Accepting that band still leaves the arm inside its
-        # measured envelope; insisting on 5 cm just timed out.
-        self.declare_parameter("standoff_tolerance_m", 0.10)
+        self.declare_parameter("standoff_tolerance_m", 0.05)
         self.declare_parameter("square_tolerance_rad", 0.05)
         self.declare_parameter("max_yaw_rate", 0.45)
         self.declare_parameter("max_forward", 0.22)
@@ -322,6 +313,13 @@ class ApproachNode(Node):
         self.book_hold_time = 3.0
         self.verify_aimed_at: Optional[float] = None
         self.book_held_since: Optional[float] = None
+        # Whether the tuck command has actually gone out (a JointTrajectory published
+        # before the controller has matched the subscription is dropped in silence --
+        # see _send/_do_tuck), and the joint positions it is going to.
+        self.joints: dict = {}
+        self.tuck_sent = False
+        self.tuck_sent_at: Optional[float] = None
+        self.create_subscription(JointState, TOPIC_JOINT_STATES, self._on_joints, 10)
         self.create_subscription(
             PointStamped, TOPIC_BOOK_POINT, self._on_book_point, 10)
         self.create_subscription(Float32, TOPIC_BIN_X, self._on_bin_x, 10)
@@ -382,6 +380,10 @@ class ApproachNode(Node):
         p = msg.pose.pose.position
         yaw = yaw_from_quat(msg.pose.pose.orientation)
         self.odom_pose = (p.x, p.y, yaw)
+
+    def _on_joints(self, msg: JointState) -> None:
+        for name, position in zip(msg.name, msg.position):
+            self.joints[name] = position
 
     def _on_scan(self, msg: LaserScan) -> None:
         self.scan = msg
@@ -509,6 +511,9 @@ class ApproachNode(Node):
             self.target_odom = None
             self.anchor_candidates.clear()
             self.anchor_disagree.clear()
+        if state is State.TUCK:
+            self.tuck_sent = False
+            self.tuck_sent_at = None
         if state is State.BIN_SEARCH:
             self.bin_head_levelled = False
         if state is State.FACE_BIN:
@@ -616,7 +621,9 @@ class ApproachNode(Node):
         retry only when nothing was listening. Re-sending a command that did arrive is
         worse than not sending it -- each new JointTrajectory replaces the one in
         progress and restarts its time_from_start, so a trajectory re-sent on a timer
-        never finishes.
+        never finishes. That was the actual cause of the jittery startup tuck: several
+        resends landed in the controller's first half-second, each yanking the arm back
+        to the start of the spline.
         """
         if pub.get_subscription_count() == 0:
             self.get_logger().warn(
@@ -634,38 +641,33 @@ class ApproachNode(Node):
         return True
 
     def _send_tuck(self) -> None:
-        """Command both arms and the torso to the driving posture (src1 single-point)."""
+        """Command the src1 single-point arm and torso tuck."""
         for pub, side in ((self.pub_arm_left, "left"), (self.pub_arm_right, "right")):
             traj = JointTrajectory()
             traj.joint_names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
             point = JointTrajectoryPoint()
-            pose = list(RIGHT_TUCK) if side == "right" else list(TUCK_POSE)
+            pose = RIGHT_TUCK if side == "right" else TUCK_POSE
             point.positions = [float(v) for v in pose]
             point.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
             traj.points = [point]
             pub.publish(traj)
 
-        # Torso with them, or the folded arm sits inside the base.
         torso = JointTrajectory()
         torso.joint_names = ["torso_lift_joint"]
         lift = JointTrajectoryPoint()
-        lift.positions = [float(TUCK_TORSO)]
+        lift.positions = [TUCK_TORSO]
         lift.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
         torso.points = [lift]
         self.pub_torso.publish(torso)
-        self.get_logger().info("stowing arms for driving")
+        self.get_logger().info("stowing arms + torso for driving")
 
     def _do_tuck(self) -> None:
         self._stop()  # no driving until the arms are in
-        elapsed = self._now() - self.state_since
-
-        # Repeat only during the first moment, to cover the controller not yet being
-        # subscribed. Repeating later is actively harmful: each JointTrajectory replaces
-        # the one in progress and restarts its time_from_start, so a trajectory re-sent
-        # every two seconds never finishes.
+        elapsed = self._elapsed()
+        # Cover controller discovery, but stop quickly: every re-publish restarts the
+        # trajectory and later repeats prevent the fold from finishing.
         if elapsed < 0.6:
             self._send_tuck()
-
         if elapsed >= self.tuck_time + 2.0:
             self._enter(State.SEARCH)
 
@@ -1295,11 +1297,9 @@ class ApproachNode(Node):
         self._aim_head()
 
         cmd = Twist()
-        # Floor vx a little higher than 0.05 on the last metres: at GUI RTF the old
-        # floor was slower than the base's sideways drift, so remaining never closed.
-        cmd.linear.x = min(self.max_fwd, max(0.08, 0.5 * remaining))
+        cmd.linear.x = min(self.max_fwd, max(0.05, 0.5 * remaining))
 
-        # Correct sideways, not by turning -- but NOT on the final stretch to standoff.
+        # Correct sideways, not by turning.
         #
         # Turning to chase the bearing while driving converts a small angular error into a
         # large lateral excursion: the robot yaws a little, then drives along the new
@@ -1310,37 +1310,27 @@ class ApproachNode(Node):
         # dy = +0.233 with dyaw = 0.000), so lateral error can be taken out directly while
         # the heading stays square to the shelf. The earlier belief that strafing yaws the
         # base was an artefact of measuring with the arms extended.
-        #
-        # Exception -- final close to grasping standoff: simultaneous vy was measured
-        # larger than vx while remaining sat at 0.07–0.15 m, and ahead drifted from
-        # 0.82 m back out to 0.89 m until the state timed out. ACQUIRE already lined the
-        # book up; on this last stretch only drive forward.
-        final_stretch = (
-            self.approach_target <= self.standoff + 1e-9 and remaining < 0.35
-        )
-        bearing = "final"
-        if not final_stretch:
-            # Steer to the anchored target while one is held, falling back to the live
-            # marker bearing only before there is one. The bearing is what jumped.
-            target = self._target_in_base()
-            if target is not None:
-                # Line the book up with the shoulder, not with the middle of the robot.
-                error_m = float(target[1]) - SHOULDER_OFFSET_Y
-                bearing = f"{error_m:+.3f}m"
-                if abs(error_m) > self.centre_tol_m:
-                    # +y is to the left of the base, and so is a positive error.
-                    cmd.linear.y = math.copysign(
-                        min(self.max_lateral, 0.6 * abs(error_m) + 0.02), error_m)
-            else:
-                column_cx = self._column_cx_fresh()
-                bearing = "stale"
-                if column_cx is not None:
-                    error_px = column_cx - self.image_width / 2.0
-                    bearing = f"{error_px:+6.1f}px"
-                    if abs(error_px) > self.centre_tol:
-                        # Image x grows to the right; +y is to the left of the base.
-                        cmd.linear.y = -math.copysign(
-                            min(self.max_lateral, 0.0012 * abs(error_px)), error_px)
+        # Steer to the anchored target while one is held, falling back to the live
+        # marker bearing only before there is one. The bearing is what jumped.
+        target = self._target_in_base()
+        if target is not None:
+            # Line the book up with the shoulder, not with the middle of the robot.
+            error_m = float(target[1]) - SHOULDER_OFFSET_Y
+            bearing = f"{error_m:+.3f}m"
+            if abs(error_m) > self.centre_tol_m:
+                # +y is to the left of the base, and so is a positive error.
+                cmd.linear.y = math.copysign(
+                    min(self.max_lateral, 0.6 * abs(error_m) + 0.02), error_m)
+        else:
+            column_cx = self._column_cx_fresh()
+            bearing = "stale"
+            if column_cx is not None:
+                error_px = column_cx - self.image_width / 2.0
+                bearing = f"{error_px:+6.1f}px"
+                if abs(error_px) > self.centre_tol:
+                    # Image x grows to the right; +y is to the left of the base.
+                    cmd.linear.y = -math.copysign(
+                        min(self.max_lateral, 0.0012 * abs(error_px)), error_px)
         self.pub_cmd.publish(cmd)
 
         # Log what was commanded alongside what the range is doing. Range alone cannot
