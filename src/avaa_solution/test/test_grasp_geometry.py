@@ -17,7 +17,7 @@ from avaa_solution.grasp_node import (
     row_to_height,
 )
 
-HEIGHTS = [1.391, 1.061, 0.731, 0.401]   # top shelf first
+HEIGHTS = [1.501, 1.171, 0.841, 0.511]   # book centres, top shelf first
 
 
 def test_defaults_are_ordered_top_shelf_first():
@@ -30,12 +30,12 @@ def test_rows_are_evenly_spaced():
         assert gap == pytest.approx(0.33, abs=0.005)
 
 
-@pytest.mark.parametrize("row,expected", [(1, 1.391), (2, 1.061), (3, 0.731), (4, 0.401)])
+@pytest.mark.parametrize("row,expected", [(1, 1.501), (2, 1.171), (3, 0.841), (4, 0.511)])
 def test_top_down_numbering(row, expected):
     assert row_to_height(row, HEIGHTS, top_down=True) == pytest.approx(expected)
 
 
-@pytest.mark.parametrize("row,expected", [(1, 0.401), (2, 0.731), (3, 1.061), (4, 1.391)])
+@pytest.mark.parametrize("row,expected", [(1, 0.511), (2, 0.841), (3, 1.171), (4, 1.501)])
 def test_bottom_up_numbering(row, expected):
     assert row_to_height(row, HEIGHTS, top_down=False) == pytest.approx(expected)
 

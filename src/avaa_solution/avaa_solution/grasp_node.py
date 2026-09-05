@@ -136,7 +136,10 @@ GRIPPER_OPEN_MIN = 0.044
 #                             topples after 78 mm
 GRIPPER_CLAMP = -0.0010
 
-DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
+# Book centre heights in base_link, top row first. These must match
+# perception_node.ROW_HEIGHTS_BASE. The old values were shelf-board heights,
+# 110 mm below the book centres.
+DEFAULT_ROW_HEIGHTS = [1.501, 1.171, 0.841, 0.511]
 
 # Folded for driving / MoveIt start — same poses as approach_node (src1 single-point).
 #
@@ -258,11 +261,10 @@ class GraspNode(Node):
         # and pushes -- and a third of a newton is nothing, so the book goes over before
         # the second pad arrives. Every failed run ended with it tipped, not slipped.
         #
-        # 20 mm rather than 45. At 45 the tip sat on the shelf lip on the bottom row
-        # (row 4 at z=0.356) and the wrist scraped the board on the way in. 20 mm still
-        # lowers the tipping lever vs mid-height, and the pads clear the board the book
-        # stands on. Asked: raise the final grasp a bit.
-        self.declare_parameter("grasp_below_centre_m", 0.020)
+        # Aim at the actual centre. The former row table was already 110 mm too low,
+        # then this offset removed another 20 mm; row 3 consequently targeted z=0.711
+        # instead of the true centre at z=0.841 and passed below the blue book.
+        self.declare_parameter("grasp_below_centre_m", 0.0)
         # How still the book has to look, and for how long, before the jaws close.
         self.declare_parameter("quiet_spread_m", 0.004)
         self.declare_parameter("quiet_for_sec", 2.5)
