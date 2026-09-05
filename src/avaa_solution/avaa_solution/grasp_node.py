@@ -315,6 +315,10 @@ class GraspNode(Node):
         # accepting it turns a validated pre-grasp into an unreachable line. Cap the
         # correction so only real drift is followed.
         self.declare_parameter("max_reaim_m", 0.10)
+        # Lateral jumps are tighter: 80 mm of "base slide" sideways put the straight
+        # reach through a shelf divider after a posture that had been validated for a
+        # different bay (gripper jammed into the post at pre-grasp).
+        self.declare_parameter("max_reaim_lateral_m", 0.04)
 
         self.row_heights = list(
             self.get_parameter("row_heights").get_parameter_value().double_array_value
@@ -348,6 +352,8 @@ class GraspNode(Node):
         self.leg_target = None
         self.settle = float(self.get_parameter("settle_sec").value)
         self.max_reaim = float(self.get_parameter("max_reaim_m").value)
+        self.max_reaim_lateral = float(
+            self.get_parameter("max_reaim_lateral_m").value)
         self.settled_at = None
         # Row and face locked when the grasp starts, so mid-reach perception flips
         # (row 4 → 2 → 4 in one log) cannot retarget the arm onto another book.
@@ -748,7 +754,16 @@ class GraspNode(Node):
                                 y, height])
                 grasp = np.array([face_x + self.grasp_depth, y, height])
                 if self.grasp_target is not None:
-                    moved = float(np.linalg.norm(grasp - self.grasp_target))
+                    delta = grasp - self.grasp_target
+                    moved = float(np.linalg.norm(delta))
+                    lateral = abs(float(delta[1]))
+                    if lateral > self.max_reaim_lateral:
+                        self.get_logger().warn(
+                            "perception jumped %.0f mm sideways (cap %.0f mm) — likely "
+                            "another bay; holding the locked target at %s"
+                            % (lateral * 1000, self.max_reaim_lateral * 1000,
+                               np.round(self.grasp_target, 3).tolist()))
+                        return
                     if moved > self.max_reaim:
                         self.get_logger().warn(
                             "perception jumped %.0f mm (cap %.0f mm) — likely another "
@@ -1356,15 +1371,32 @@ class GraspNode(Node):
             self.pre_target, seed=list(self.pre_solution),
             approach=GRASP_APPROACH, closing=GRASP_CLOSING,
             pin=self._torso_for(float(self.pre_target[2])))
+        # Staging clearance is not enough: a re-aim that only checks the pre-grasp
+        # point can put the straight line into the shelf through a divider (measured:
+        # 81 mm re-aim, then "obstructed 100% of the way in" with the gripper in the
+        # post). Demand the same reach fraction the SCENE search required.
         if moved is not None and self._clear(moved):
-            shift = float(np.linalg.norm(
-                np.asarray(self.chain.fk(list(moved))[:3, 3])
-                - np.asarray(self.chain.fk(list(self.pre_solution))[:3, 3])))
-            if shift > 0.005:
-                self.get_logger().info(
-                    "pre-grasp re-aimed %.0f mm for the base having moved"
-                    % (shift * 1000))
-            self.pre_solution = moved
+            fraction = self._reach_clearance(
+                moved, self.pre_target, self.grasp_target)
+            if fraction >= self.min_fraction:
+                shift = float(np.linalg.norm(
+                    np.asarray(self.chain.fk(list(moved))[:3, 3])
+                    - np.asarray(self.chain.fk(list(self.pre_solution))[:3, 3])))
+                if shift > 0.005:
+                    self.get_logger().info(
+                        "pre-grasp re-aimed %.0f mm for the base having moved"
+                        % (shift * 1000))
+                self.pre_solution = moved
+            else:
+                self.get_logger().warn(
+                    "re-aimed pre-grasp only clears %.0f%% into the shelf; "
+                    "searching for another posture" % (fraction * 100.0))
+                found = self._posture_that_can_reach_in()
+                if found is not None:
+                    self.pre_solution = found
+                else:
+                    self.get_logger().warn(
+                        "no replacement posture; keeping the one from SCENE")
         elif moved is None:
             self.get_logger().warn(
                 "could not re-aim the pre-grasp; going to the one planned earlier")
@@ -1444,12 +1476,30 @@ class GraspNode(Node):
 
         path = self._straight_path(self.pre_solution, start_point, leg_end)
         if path is None:
-            self.get_logger().error(
-                "no clear line from pre-grasp %s into the shelf toward %s"
-                % (np.round(start_point, 3).tolist(),
-                   np.round(self.grasp_target, 3).tolist()))
-            self._enter(State.FAILED)
-            return
+            # Last chance: the arm may have settled off the SCENE posture (logged
+            # +44 mm sideways) so re-seed from where it actually is.
+            here = self._gripper_now()
+            current = self._current_joints()
+            if here is not None and current is not None:
+                self.get_logger().warn(
+                    "planned line blocked; retrying the reach from the arm as it is")
+                path = self._straight_path(current, here, leg_end)
+            if path is None:
+                found = self._posture_that_can_reach_in()
+                if found is not None:
+                    self.pre_solution = found
+                    start_point = np.asarray(
+                        self.chain.fk(list(found))[:3, 3], dtype=float)
+                    path = self._straight_path(found, start_point, leg_end)
+                    if path is not None and current is not None:
+                        path = [list(current)] + list(path)
+            if path is None:
+                self.get_logger().error(
+                    "no clear line from pre-grasp %s into the shelf toward %s"
+                    % (np.round(start_point, 3).tolist(),
+                       np.round(self.grasp_target, 3).tolist()))
+                self._enter(State.FAILED)
+                return
         self.reach_path = path
         duration = self._send_chain_waypoints(path)
         self.advance_deadline = self.get_clock().now() + RclDuration(
