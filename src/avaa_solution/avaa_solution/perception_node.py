@@ -67,6 +67,12 @@ GRASP_FRAME = "base_link"
 ROW_HEIGHTS_BASE = [1.501, 1.171, 0.841, 0.511]
 DEPTH_HEIGHT_BIAS = 0.042
 
+# How many consecutive depth readings must agree on the same far-off row before the
+# marker row is overruled. One reading is not enough: a run with a 15/15 unanimous
+# row-3 vote was switched to row 1 by a single point, after which the height gate
+# rejected the real book for the rest of the run and /row sent the grasp two shelves up.
+HEIGHT_OVERRIDE_SAMPLES = 8
+
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -112,6 +118,9 @@ class PerceptionNode(Node):
         self.locked_book_x: Optional[float] = None
         # Confident row readings, voted on before anything is latched. See _publish_row.
         self.row_votes = deque(maxlen=15)
+        # Consecutive depth readings that put the book two or more rows from the
+        # marker row. See _cross_check_row.
+        self.height_disagreements: deque = deque(maxlen=HEIGHT_OVERRIDE_SAMPLES)
         self.started_at = None
         self.row_majority = 0.7
 
@@ -297,24 +306,40 @@ class PerceptionNode(Node):
 
         Being one row out is within what the height bias can explain, so that is left
         alone and only logged. Two rows apart is 660 mm and the height cannot be that
-        wrong, so the height wins.
+        wrong for the *target* book -- but a single point can belong to a same-coloured
+        book in the next column that got grouped under this one, so the height only wins
+        after HEIGHT_OVERRIDE_SAMPLES consecutive readings name the same far-off row.
         """
         if self.reported_row is None:
             return
         implied = self._row_from_height(point)
         if implied is None or implied == self.reported_row:
+            self.height_disagreements.clear()
             return
         if abs(implied - self.reported_row) < 2:
+            self.height_disagreements.clear()
             self.get_logger().info(
                 f"row {self.reported_row} from the markers, {implied} from the measured "
                 f"height; keeping {self.reported_row}", throttle_duration_sec=10.0)
             return
+        self.height_disagreements.append(implied)
+        agreed = (len(self.height_disagreements) == HEIGHT_OVERRIDE_SAMPLES
+                  and len(set(self.height_disagreements)) == 1)
+        if not agreed:
+            self.get_logger().warn(
+                f"row {self.reported_row} from the markers but this book measures at row "
+                f"{implied} (z={float(point[2]):.2f}); "
+                f"{len(self.height_disagreements)}/{HEIGHT_OVERRIDE_SAMPLES} readings "
+                "before the height overrules the markers", throttle_duration_sec=2.0)
+            return
         self.get_logger().warn(
-            f"row {self.reported_row} from the markers but the book measures at row "
-            f"{implied}, {abs(implied - self.reported_row)} rows away. The markers are "
-            f"wrong; switching to {implied}")
+            f"row {self.reported_row} from the markers but the book has measured at row "
+            f"{implied} for {HEIGHT_OVERRIDE_SAMPLES} readings in a row, "
+            f"{abs(implied - self.reported_row)} rows away. The markers are wrong; "
+            f"switching to {implied}")
         self.reported_row = implied
         self.row_votes.clear()
+        self.height_disagreements.clear()
 
     def _publish_book_point(self, target: bd.Book) -> None:
         """Publish the target book's 3D position in base_link, for the grasp controller.
