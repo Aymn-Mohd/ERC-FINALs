@@ -86,17 +86,15 @@ ODOM_FRAME = "odom"
 SHOULDER_OFFSET_Y = 0.159
 CAMERA_FRAME = "head_front_camera_depth_optical_frame"
 
-# base_link sits this far above base_footprint (wheel_radius, tiago_pro.urdf
-# base_footprint_joint). Row heights are quoted in base_link.
-BASE_LINK_Z = 0.0762
+# base_link sits this far above base_footprint. Row heights are quoted in base_link.
+BASE_LINK_Z = 0.186
 
 # head_2_joint: negative looks down, roughly one-for-one in radians. Limits from the URDF.
 HEAD_TILT_MIN = -1.047   # about 60 degrees down
 HEAD_TILT_MAX = 0.349    # about 20 degrees up
 
-# Book centre z in base_link for rows 1..4, top shelf first. Same table as grasp_node
-# (settled book centres from the spawn heights in erc_bringup, minus BASE_LINK_Z).
-DEFAULT_ROW_HEIGHTS = [1.501, 1.171, 0.841, 0.511]
+# Gripper z in base_link for rows 1..4, top shelf first.
+DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
 # Scan returns inside this radius of base_footprint are the robot itself, not obstacles.
 # The base is 0.717 x 0.497 m, so its circumscribed radius is 0.437 m; this sits just
