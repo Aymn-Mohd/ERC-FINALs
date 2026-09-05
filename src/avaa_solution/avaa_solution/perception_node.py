@@ -235,7 +235,11 @@ class PerceptionNode(Node):
         # looking along it rather than at the target column. The book itself is the right
         # thing to steer by once the marker is gone.
         self.pub_column_x.publish(Float32(data=float(target.cx)))
-        self._publish_book_point(target)
+        # Without a marker this target is selected only by image-x proximity. When
+        # several books share the colour, its measured height must not overwrite the
+        # marker-voted row: a neighbouring column's blue book did exactly that and
+        # changed row 3 to row 1 while the real target remained visible on row 3.
+        self._publish_book_point(target, cross_check_row=False)
         self.get_logger().info(
             f"tracking {self.book_colour} book without marker "
             f"({len(candidates)} candidate(s), row {self.reported_row})",
@@ -278,8 +282,11 @@ class PerceptionNode(Node):
             f"wrong; switching to {implied}")
         self.reported_row = implied
         self.row_votes.clear()
+        # Do not wait for another frame/marker path to propagate the correction.
+        self.pub_row.publish(Int32(data=implied))
 
-    def _publish_book_point(self, target: bd.Book) -> None:
+    def _publish_book_point(self, target: bd.Book,
+                            cross_check_row: bool = True) -> None:
         """Publish the target book's 3D position in base_link, for the grasp controller.
 
         The RGB and depth streams share intrinsics and dimensions exactly, so the box
@@ -337,8 +344,9 @@ class PerceptionNode(Node):
         msg.header.frame_id = GRASP_FRAME
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.point.x, msg.point.y, msg.point.z = (float(v) for v in point)
+        if cross_check_row:
+            self._cross_check_row(point)
         self.pub_book_point.publish(msg)
-        self._cross_check_row(point)
 
     def _process(self) -> None:
         if self.latest_frame is None:
