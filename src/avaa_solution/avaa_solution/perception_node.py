@@ -219,23 +219,34 @@ class PerceptionNode(Node):
             expected_z = (ROW_HEIGHTS_BASE[self.reported_row - 1] + DEPTH_HEIGHT_BIAS)
 
         scored = []
+        rejected = []
         for book in candidates:
             px = abs(book.cx - anchor)
             if (expected_z is not None and self.depth_image is not None
                     and self.intrinsics is not None):
                 point = dl.locate(book.bbox, self.depth_image, self.intrinsics)
                 if point is not None:
-                    hz = abs(float(point[2]) - expected_z)
-                    # One row is ~0.33 m. Drop books a full shelf away from the locked row.
-                    if hz > 0.22:
+                    dz = float(point[2]) - expected_z
+                    # One row is 0.33 m. Drop books a full shelf away from the locked
+                    # row. The window is lopsided because the error only ever goes up:
+                    # the colour box takes in the book's top face, and the lower the
+                    # row sits under the camera the more of that face it sees. Row 4
+                    # read +0.17..0.25 over expected across runs; a symmetric 0.22 cut
+                    # rejected every candidate on one of them and the approach stalled
+                    # with "no bearing". A book one row up reads at least +0.33, still
+                    # outside; one row down reads -0.33 + bias, below -0.10.
+                    if not -0.10 <= dz <= 0.30:
+                        rejected.append(dz)
                         continue
-                    scored.append((px + 500.0 * hz, book))
+                    scored.append((px + 500.0 * abs(dz), book))
                     continue
             scored.append((px, book))
         if not scored:
+            offsets = ", ".join(f"{dz:+.2f}" for dz in sorted(rejected))
             self.get_logger().warn(
                 f"no {self.book_colour} book matches row {self.reported_row} height "
-                f"({len(candidates)} candidate(s) in view); holding",
+                f"({len(candidates)} candidate(s) in view, height offsets vs expected "
+                f"{expected_z:.2f}: {offsets or 'no depth'}); holding",
                 throttle_duration_sec=5.0)
             return
         target = min(scored, key=lambda item: item[0])[1]
