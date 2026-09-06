@@ -12,6 +12,7 @@ from avaa_solution.grasp_node import (
     DEFAULT_ROW_HEIGHTS,
     DEFAULT_GRASP_DEPTH,
     GRASP_FRAME_TO_PAD_CENTER,
+    GRASP_PAD_OVERLAP,
     GRIPPER_CLAMP,
     GRIPPER_OPEN,
     PREGRASP_TRIALS,
@@ -138,6 +139,7 @@ def test_grasp_search_uses_full_resolution_and_trial_budget():
     assert TORSO_MAX in TORSO_SEARCH_LEVELS
 
 
-def test_grasp_frame_places_pad_center_at_book_depth_center():
+def test_grasp_frame_places_pads_just_inside_book_face():
     assert DEFAULT_GRASP_DEPTH - GRASP_FRAME_TO_PAD_CENTER == pytest.approx(
-        BOOK_DEPTH / 2.0)
+        GRASP_PAD_OVERLAP)
+    assert GRASP_PAD_OVERLAP < BOOK_DEPTH / 2.0

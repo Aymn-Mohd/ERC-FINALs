@@ -156,12 +156,15 @@ RIGHT_ARM_JOINTS = [f"arm_right_{i}_joint" for i in range(1, 8)]
 GRASP_APPROACH = [1.0, 0.0, 0.0]
 GRASP_CLOSING = [0.0, 1.0, 0.0]
 
-# The book is 160 mm deep. The finger-pad centre sits 29.7 mm behind the
-# gripper_left_grasping_link used by FK/IK, so putting that link 109.7 mm past the
-# front face places the pads exactly at the book's depth centre.
+# The book centre is 80 mm behind its visible front face, but that is not a safe
+# closing depth: open fingers driven that far in push the free-standing book before
+# they close. The finger-pad centre sits 29.7 mm behind the IK frame. Put the pads
+# only 25 mm past the front face—enough overlap to close around the book, without
+# driving the palm or finger roots toward its centre.
 BOOK_DEPTH = 0.160
 GRASP_FRAME_TO_PAD_CENTER = 0.0297
-DEFAULT_GRASP_DEPTH = BOOK_DEPTH / 2.0 + GRASP_FRAME_TO_PAD_CENTER
+GRASP_PAD_OVERLAP = 0.025
+DEFAULT_GRASP_DEPTH = GRASP_FRAME_TO_PAD_CENTER + GRASP_PAD_OVERLAP
 
 # A book is 0.25 m tall and stands on the board below it, so the board sits this far under
 # the row height. The 0.02 is half the board thickness.
@@ -226,8 +229,9 @@ class GraspNode(Node):
         # jaws are: they sit 29.7 mm behind that frame, measured from TF. At 0.05 a
         # perfect arrival put the jaws 20 mm inside the face, and an arrival 29 mm short
         # in depth -- inside tolerance, and dead on sideways and in height -- closed them
-        # 9 mm in FRONT of the book. 109.7 mm puts the finger-pad centre exactly in
-        # the middle of a 160 mm-deep book.
+        # 9 mm in FRONT of the book. 54.7 mm puts the pads 25 mm past the face:
+        # enough to overlap the book before closing, without pushing toward its
+        # 80 mm-deep geometric centre.
         self.declare_parameter("grasp_depth_m", DEFAULT_GRASP_DEPTH)
         # No lift before withdrawing.
         #
@@ -250,8 +254,8 @@ class GraspNode(Node):
         # is the tight one: the jaws open to 60.5 mm around a 30 mm book, so much
         # more than 15 mm off centre and a finger meets the front of the book
         # instead of passing it. Depth and height are forgiving -- the book is
-        # 160 mm deep and 250 mm tall -- and grasp_depth_m puts the jaws in the
-        # middle of it, so being short in depth costs margin rather than the grasp.
+        # 160 mm deep and 250 mm tall. The shallow pad overlap makes depth tighter:
+        # arriving more than 15 mm short would leave too little book between the jaws.
         self.declare_parameter("arrival_tol_lateral_m", 0.012)
         self.declare_parameter("arrival_tol_depth_m", 0.015)
         self.declare_parameter("arrival_tol_height_m", 0.015)
@@ -872,11 +876,13 @@ class GraspNode(Node):
             self.get_logger().warn(
                 "no odom transform; the target cannot be held against base movement")
 
-        pad_center = self.grasp_target - np.array(
+        book_center = np.array([face_x + BOOK_DEPTH / 2.0, y, height])
+        pad_target = self.grasp_target - np.array(
             [GRASP_FRAME_TO_PAD_CENTER, 0.0, 0.0])
         self.get_logger().info(
-            f"row {self.row} book centre / finger-pad target "
-            f"x={pad_center[0]:.3f} y={pad_center[1]:.3f} z={pad_center[2]:.3f}; "
+            f"row {self.row} book centre "
+            f"x={book_center[0]:.3f} y={book_center[1]:.3f} z={book_center[2]:.3f}; "
+            f"shallow finger-pad target x={pad_target[0]:.3f}, "
             f"IK frame x={self.grasp_target[0]:.3f}")
         return True
 
@@ -1275,11 +1281,11 @@ class GraspNode(Node):
         return waypoints
 
     def _shelf_entry_path(self, start_solution, start_point, end_point):
-        """Reach via a short lift/back-off, always ending at the requested book centre.
+        """Reach via a short lift/back-off, always ending at the requested grasp point.
 
         Used when the tip is already on the shelf lip: backing out a few centimetres and
         lifting clears the wrist under the board above. The lift is only an intermediate
-        waypoint; returning a path above ``end_point`` would close above the book centre.
+        waypoint; returning a path above ``end_point`` would close above the target.
         """
         start_point = np.asarray(start_point, dtype=float)
         end_point = np.asarray(end_point, dtype=float)
@@ -1315,7 +1321,7 @@ class GraspNode(Node):
                 high[-1], lifted, end_point, steps=REACH_STEPS)
             if centre is not None:
                 self.get_logger().info(
-                    "entry line cleared via a 25 mm lift; returning to book centre")
+                    "entry line cleared via a 25 mm lift; returning to grasp target")
                 return list(first) + list(high[1:]) + list(centre[1:])
 
         direct = self._straight_path(
