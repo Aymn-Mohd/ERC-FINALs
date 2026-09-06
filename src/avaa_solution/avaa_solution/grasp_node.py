@@ -136,7 +136,7 @@ GRIPPER_OPEN_MIN = 0.044
 #                             topples after 78 mm
 GRIPPER_CLAMP = -0.0010
 
-# Book centre heights in base_link, matching perception and approach.
+# Physical book-centre heights in base_link, used only for grasp targets.
 DEFAULT_ROW_HEIGHTS = [1.501, 1.171, 0.841, 0.511]
 
 # Folded for driving / MoveIt start — same poses as approach_node (src1 single-point).

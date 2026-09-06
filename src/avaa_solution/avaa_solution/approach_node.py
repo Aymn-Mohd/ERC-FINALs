@@ -93,8 +93,9 @@ BASE_LINK_Z = 0.186
 HEAD_TILT_MIN = -1.047   # about 60 degrees down
 HEAD_TILT_MAX = 0.349    # about 20 degrees up
 
-# Book centre z in base_link for rows 1..4, top shelf first.
-DEFAULT_ROW_HEIGHTS = [1.501, 1.171, 0.841, 0.511]
+# Original head-aim reference heights in base_link, top row first. Physical book
+# centres are used only by grasp_node.
+DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
 # Scan returns inside this radius of base_footprint are the robot itself, not obstacles.
 # The base is 0.717 x 0.497 m, so its circumscribed radius is 0.437 m; this sits just

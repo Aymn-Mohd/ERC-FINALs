@@ -56,12 +56,10 @@ TOPIC_TARGET_BOOK_POINT = "/avaa/perception/target_book_point"
 # Where the grasp controller wants the book expressed.
 GRASP_FRAME = "base_link"
 
-# Book centre heights in base_link, top row first. The former table represented
-# shelf-board heights and was 110 mm below each book centre. Once compared against
-# the true centres, the deprojected point is about 42 mm high because the camera sees
-# more of the upper face.
-ROW_HEIGHTS_BASE = [1.501, 1.171, 0.841, 0.511]
-DEPTH_HEIGHT_BIAS = 0.042
+# Original perception row-reference heights in base_link, top row first. These are
+# intentionally separate from grasp's physical book-centre targets.
+ROW_HEIGHTS_BASE = [1.391, 1.061, 0.731, 0.401]
+DEPTH_HEIGHT_BIAS = 0.152
 
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
