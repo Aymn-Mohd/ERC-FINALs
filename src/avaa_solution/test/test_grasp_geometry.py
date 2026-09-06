@@ -8,9 +8,14 @@ to the wrong shelf, so both directions are pinned down here.
 import pytest
 
 from avaa_solution.grasp_node import (
+    BOOK_DEPTH,
     DEFAULT_ROW_HEIGHTS,
+    DEFAULT_GRASP_DEPTH,
+    GRASP_FRAME_TO_PAD_CENTER,
     GRIPPER_CLAMP,
     GRIPPER_OPEN,
+    PREGRASP_TRIALS,
+    REACH_STEPS,
     RIGHT_TUCK_POSE,
     TUCK_POSE,
     TUCK_TORSO,
@@ -120,3 +125,13 @@ def test_tuck_fold_is_single_point():
     from avaa_solution.grasp_node import TUCK_TIME_SEC
     assert TUCK_TIME_SEC == 5.0
     assert RIGHT_TUCK_POSE == [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
+
+
+def test_grasp_search_uses_full_resolution_and_trial_budget():
+    assert REACH_STEPS == 8
+    assert PREGRASP_TRIALS == 24
+
+
+def test_grasp_frame_places_pad_center_at_book_depth_center():
+    assert DEFAULT_GRASP_DEPTH - GRASP_FRAME_TO_PAD_CENTER == pytest.approx(
+        BOOK_DEPTH / 2.0)

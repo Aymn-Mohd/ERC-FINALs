@@ -156,6 +156,13 @@ RIGHT_ARM_JOINTS = [f"arm_right_{i}_joint" for i in range(1, 8)]
 GRASP_APPROACH = [1.0, 0.0, 0.0]
 GRASP_CLOSING = [0.0, 1.0, 0.0]
 
+# The book is 160 mm deep. The finger-pad centre sits 29.7 mm behind the
+# gripper_left_grasping_link used by FK/IK, so putting that link 109.7 mm past the
+# front face places the pads exactly at the book's depth centre.
+BOOK_DEPTH = 0.160
+GRASP_FRAME_TO_PAD_CENTER = 0.0297
+DEFAULT_GRASP_DEPTH = BOOK_DEPTH / 2.0 + GRASP_FRAME_TO_PAD_CENTER
+
 # A book is 0.25 m tall and stands on the board below it, so the board sits this far under
 # the row height. The 0.02 is half the board thickness.
 BOARD_DROP = 0.125 + 0.02
@@ -177,6 +184,13 @@ def row_to_height(row: int, heights: List[float], top_down: bool = True) -> Opti
 def facing_shelf() -> Quaternion:
     """Identity: the grasping frame reaches along base x and closes across base y."""
     return Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+
+
+# Candidate scoring and execution must inspect the same Cartesian samples. With four
+# scoring samples a collision at the final sample appeared as "75% clear", then the
+# eight-sample execution found the obstruction and failed beside the shelf.
+REACH_STEPS = 8
+PREGRASP_TRIALS = 24
 
 
 class State(Enum):
@@ -208,8 +222,9 @@ class GraspNode(Node):
         # jaws are: they sit 29.7 mm behind that frame, measured from TF. At 0.05 a
         # perfect arrival put the jaws 20 mm inside the face, and an arrival 29 mm short
         # in depth -- inside tolerance, and dead on sideways and in height -- closed them
-        # 9 mm in FRONT of the book. 0.11 puts them in the middle of a 160 mm book.
-        self.declare_parameter("grasp_depth_m", 0.11)
+        # 9 mm in FRONT of the book. 109.7 mm puts the finger-pad centre exactly in
+        # the middle of a 160 mm-deep book.
+        self.declare_parameter("grasp_depth_m", DEFAULT_GRASP_DEPTH)
         # No lift before withdrawing.
         #
         # Lifting 30 mm off the shelf before pulling out is the textbook move and it
@@ -234,8 +249,8 @@ class GraspNode(Node):
         # 160 mm deep and 250 mm tall -- and grasp_depth_m puts the jaws in the
         # middle of it, so being short in depth costs margin rather than the grasp.
         self.declare_parameter("arrival_tol_lateral_m", 0.012)
-        self.declare_parameter("arrival_tol_depth_m", 0.030)
-        self.declare_parameter("arrival_tol_height_m", 0.030)
+        self.declare_parameter("arrival_tol_depth_m", 0.015)
+        self.declare_parameter("arrival_tol_height_m", 0.015)
         self.declare_parameter("reach_attempts", 6)
         # How much of the reach is left for a second, separately aimed leg.
         #
@@ -855,9 +870,12 @@ class GraspNode(Node):
             self.get_logger().warn(
                 "no odom transform; the target cannot be held against base movement")
 
+        pad_center = self.grasp_target - np.array(
+            [GRASP_FRAME_TO_PAD_CENTER, 0.0, 0.0])
         self.get_logger().info(
-            f"row {self.row} at z={height:.3f}; book face at x={face_x:.3f} "
-            f"y={y:.3f}; reaching to x={self.grasp_target[0]:.3f}")
+            f"row {self.row} book centre / finger-pad target "
+            f"x={pad_center[0]:.3f} y={pad_center[1]:.3f} z={pad_center[2]:.3f}; "
+            f"IK frame x={self.grasp_target[0]:.3f}")
         return True
 
     def _reachable_and_clear(self, target, attempts: int = 12):
@@ -978,7 +996,7 @@ class GraspNode(Node):
                 values.append(float(value))
         return names, values
 
-    def _posture_that_can_reach_in(self, attempts: int = 12):
+    def _posture_that_can_reach_in(self, attempts: int = PREGRASP_TRIALS):
         """Choose a pre-grasp posture by whether the reach works FROM it.
 
         Two conditions, and the second is the one that was missing. A posture has to be
@@ -1007,8 +1025,11 @@ class GraspNode(Node):
                 self.get_logger().info(
                     "pre-grasp search: try %d/%d (%d clear so far, %d in collision)"
                     % (attempt + 1, attempts, len(candidates), rejected))
+            # Keep a useful collision-free near-miss as the local seed while the IK
+            # solver's own random restarts continue exploring other elbow postures.
+            trial_seed = seed if best is None else best[1]
             solution = self.chain.ik(
-                self.pre_target, seed=seed if attempt == 0 else None,
+                self.pre_target, seed=trial_seed,
                 approach=GRASP_APPROACH, closing=GRASP_CLOSING,
                 prefer=self._posture_cost(float(self.pre_target[2])),
                 pin=self._torso_for(float(self.pre_target[2])))
@@ -1061,10 +1082,11 @@ class GraspNode(Node):
                 "no usable posture for the pre-grasp in %d tries: %d in collision, "
                 "%d beyond what the arm can hold" % (attempts, rejected, expensive))
             return None
-        self.get_logger().warn(
-            "no posture gives a clear reach; the best of %d is %.0f%% and will be tried"
-            % (attempts, best[0] * 100.0))
-        return best[1]
+        self.get_logger().error(
+            "rejecting pre-grasp: best of %d trials clears only %.0f%% "
+            "(minimum %.0f%%)"
+            % (attempts, best[0] * 100.0, self.min_fraction * 100.0))
+        return None
 
     def _torso_for(self, height: float) -> dict:
         """Pin the torso so the shoulder sits level with the target.
@@ -1175,7 +1197,7 @@ class GraspNode(Node):
         return True
 
     def _reach_clearance(self, start_solution, start_point, end_point,
-                         steps: int = 4) -> float:
+                         steps: int = REACH_STEPS) -> float:
         """How far along a straight line this posture can get, as a fraction.
 
         The same walk as _straight_path, without building the trajectory, so a candidate
@@ -1203,7 +1225,8 @@ class GraspNode(Node):
             seed = solution
         return 1.0
 
-    def _straight_path(self, start_solution, start_point, end_point, steps: int = 8):
+    def _straight_path(self, start_solution, start_point, end_point,
+                       steps: int = REACH_STEPS):
         """Joint waypoints tracing a straight line in space, each one checked.
 
         The analytic solver is seeded from the previous waypoint so consecutive postures
@@ -1235,11 +1258,11 @@ class GraspNode(Node):
         return waypoints
 
     def _shelf_entry_path(self, start_solution, start_point, end_point):
-        """Straight reach with a short lift / back-off if the direct line hits a board.
+        """Reach via a short lift/back-off, always ending at the requested book centre.
 
         Used when the tip is already on the shelf lip: backing out a few centimetres and
-        lifting clears the wrist under the board above, then the same bay is reachable.
-        Returns waypoints, or None. Does not rewrite grasp_target — the caller decides.
+        lifting clears the wrist under the board above. The lift is only an intermediate
+        waypoint; returning a path above ``end_point`` would close above the book centre.
         """
         start_point = np.asarray(start_point, dtype=float)
         end_point = np.asarray(end_point, dtype=float)
@@ -1260,18 +1283,25 @@ class GraspNode(Node):
                 return None
             via = back
 
-        first = self._straight_path(start_solution, start_point, via, steps=3)
+        first = self._straight_path(
+            start_solution, start_point, via, steps=REACH_STEPS)
         if first is None:
             return None
-        second = self._straight_path(first[-1], via, lifted, steps=4)
-        if second is None:
-            second = self._straight_path(first[-1], via, end_point, steps=4)
-            if second is None:
-                return None
-        else:
-            self.get_logger().info(
-                "entry line cleared by backing off and lifting the tip 25 mm")
-        return list(first) + list(second[1:])
+        high = self._straight_path(
+            first[-1], via, lifted, steps=REACH_STEPS)
+        if high is not None:
+            centre = self._straight_path(
+                high[-1], lifted, end_point, steps=REACH_STEPS)
+            if centre is not None:
+                self.get_logger().info(
+                    "entry line cleared via a 25 mm lift; returning to book centre")
+                return list(first) + list(high[1:]) + list(centre[1:])
+
+        direct = self._straight_path(
+            first[-1], via, end_point, steps=REACH_STEPS)
+        if direct is None:
+            return None
+        return list(first) + list(direct[1:])
 
     def _add_shelf(self) -> bool:
         """Describe the shelf to the planner, as boards rather than as a block.
@@ -1351,7 +1381,8 @@ class GraspNode(Node):
         # plan the moment the real boards went in.
         self.get_logger().info(
             "searching for a pre-grasp posture that can reach into the shelf "
-            "(up to 12 MoveIt checks; can take a minute at low RTF)...")
+            "(up to %d IK trials; every reach is collision checked)..."
+            % PREGRASP_TRIALS)
         self.pre_solution = self._posture_that_can_reach_in()
         if self.pre_solution is None:
             self.get_logger().error(
@@ -1420,6 +1451,7 @@ class GraspNode(Node):
         # point can put the straight line into the shelf through a divider (measured:
         # 81 mm re-aim, then "obstructed 100% of the way in" with the gripper in the
         # post). Demand the same reach fraction the SCENE search required.
+        replacement_needed = False
         if moved is not None and self._clear(moved):
             fraction = self._reach_clearance(
                 moved, self.pre_target, self.grasp_target)
@@ -1436,18 +1468,24 @@ class GraspNode(Node):
                 self.get_logger().warn(
                     "re-aimed pre-grasp only clears %.0f%% into the shelf; "
                     "searching for another posture" % (fraction * 100.0))
-                found = self._posture_that_can_reach_in()
-                if found is not None:
-                    self.pre_solution = found
-                else:
-                    self.get_logger().warn(
-                        "no replacement posture; keeping the one from SCENE")
+                replacement_needed = True
         elif moved is None:
             self.get_logger().warn(
-                "could not re-aim the pre-grasp; going to the one planned earlier")
+                "could not re-aim the pre-grasp; searching for another posture")
+            replacement_needed = True
         else:
             self.get_logger().warn(
-                "the re-aimed pre-grasp is not collision free; keeping the planned one")
+                "the re-aimed pre-grasp is in collision; searching again")
+            replacement_needed = True
+
+        if replacement_needed:
+            found = self._posture_that_can_reach_in()
+            if found is None:
+                self.get_logger().error(
+                    "no safe pre-grasp remains after re-aim; refusing stale posture")
+                self._enter(State.FAILED)
+                return
+            self.pre_solution = found
 
         # Analytic IK -> joint trajectory. Do not ask MoveIt to plan to this posture:
         # the solution is already known, and planning fails whenever the start state is
@@ -1474,16 +1512,29 @@ class GraspNode(Node):
             self.reaches += 1
             if self.reaches < self.reach_attempts:
                 self.get_logger().warn(
-                    "pre-grasp finished %s; going again (%d of %d)"
+                    "pre-grasp finished %s; solving again from the live arm (%d of %d)"
                     % (self._miss(self.pre_target), self.reaches, self.reach_attempts))
-                if self._nudge(self.pre_solution):
-                    return
-                try:
-                    current = [self.joints[name] for name in CHAIN_JOINTS]
-                except KeyError:
+                current = self._current_joints()
+                if current is None:
                     current = list(self.pre_solution)
+                retry = self.chain.ik(
+                    self.pre_target, seed=current,
+                    approach=GRASP_APPROACH, closing=GRASP_CLOSING,
+                    prefer=self._posture_cost(float(self.pre_target[2])),
+                    pin=self._torso_for(float(self.pre_target[2])))
+                if (retry is None or not self._clear(retry)
+                        or self._reach_clearance(
+                            retry, self.pre_target,
+                            self.grasp_target) < self.min_fraction):
+                    retry = self._posture_that_can_reach_in()
+                if retry is None:
+                    self.get_logger().error(
+                        "no safe IK solution for another pre-grasp attempt")
+                    self._enter(State.FAILED)
+                    return
+                self.pre_solution = retry
                 duration = self._send_chain_waypoints(
-                    [current, list(self.pre_solution)])
+                    [current, list(retry)])
                 self.pregrasp_deadline = self.get_clock().now() + RclDuration(
                     seconds=float(duration + 8.0))
                 return
@@ -1568,6 +1619,26 @@ class GraspNode(Node):
         if arrived is not True and not timed_out:
             return
         if arrived is not True:
+            self.reaches += 1
+            current = self._current_joints()
+            here = self._gripper_now()
+            if (self.reaches < self.reach_attempts and current is not None
+                    and here is not None and target is not None):
+                retry = self._straight_path(
+                    current, here, target, steps=REACH_STEPS)
+                if retry is None:
+                    retry = self._shelf_entry_path(current, here, target)
+                if retry is not None:
+                    self.reach_path = retry
+                    duration = self._send_chain_waypoints(retry)
+                    self.advance_deadline = (
+                        self.get_clock().now()
+                        + RclDuration(seconds=float(duration + 8.0)))
+                    self.get_logger().warn(
+                        "reach stopped %s; replanned from live joints (%d of %d)"
+                        % (self._miss(target), self.reaches,
+                           self.reach_attempts))
+                    return
             self.get_logger().error(
                 "the reach did not arrive (%s)" % self._miss(target))
             self._enter(State.FAILED)
@@ -1609,7 +1680,8 @@ class GraspNode(Node):
                 span = goal - here
                 reach = float(np.linalg.norm(span))
                 mouth = goal - (self.final_approach / reach) * span
-                path = self._straight_path(start, here, mouth, steps=6)
+                path = self._straight_path(
+                    start, here, mouth, steps=REACH_STEPS)
                 if path is None:
                     path = self._shelf_entry_path(start, here, mouth)
                 if path is None:
@@ -1629,14 +1701,10 @@ class GraspNode(Node):
                     % (remaining * 1000, drifted * 1000))
                 return
 
-            final = self._straight_path(start, here, goal, steps=4)
+            final = self._straight_path(
+                start, here, goal, steps=REACH_STEPS)
             if final is None:
                 final = self._shelf_entry_path(start, here, goal)
-                if final is not None:
-                    tip = np.asarray(
-                        self.chain.fk(list(final[-1]))[:3, 3], dtype=float)
-                    self.grasp_target = tip
-                    goal = tip
             if final is None:
                 self.get_logger().error(
                     "no clear line for the last %.0f mm" % (remaining * 1000))

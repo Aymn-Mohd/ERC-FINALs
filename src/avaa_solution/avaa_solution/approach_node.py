@@ -108,6 +108,7 @@ TOPIC_BIN_X = "/avaa/perception/bin_x"
 TOPIC_ODOM = "/odom"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
 TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
+TOPIC_TORSO = "/torso_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
 TOPIC_STATE = "/avaa/approach/state"
 TOPIC_CMD = "/cmd_vel"
@@ -121,24 +122,12 @@ SENSOR_QOS = QoSProfile(
 )
 
 
-# Arm posture for driving, measured rather than guessed (see try_tuck.py).
-#
-# The arms spawn with every joint at zero, which for this arm is fully extended: the
-# gripper reaches 0.838 m forward, 0.478 m beyond the front of the base. Driving at the
-# shelf in that posture wedges the arm against it -- observed as six simultaneous contacts
-# between both grippers, both arm_6 links and erc_shelf, with the base unable to advance
-# while the LiDAR still read 0.94 m of clear space ahead. Each contact event costs half a
-# point.
-#
-# This pose measured 0.319 m forward and 0.174 m lateral, both inside the base footprint
-# (0.36 m half-length, 0.249 m half-width), with no contacts. Joint 2 does most of the
-# work; the elbow pulls the forearm in laterally, and joint 1 finishes the job.
-#
-# NOTE: this posture puts arm_left_2 through arm_left_5 in self-collision against
-# torso_base_link and torso_lift_link (found later when MoveIt was added for grasping;
-# Gazebo does not check self-collision, so it never mattered for driving). Left as the
-# original measured value for now -- revisit if/when arm work resumes.
-TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
+# Collision-free src1 driving tuck. The torso must move with the arms; these arm
+# angles alone at torso zero place wrist links inside base_link.
+TUCK_POSE = [0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0]
+RIGHT_TUCK = RIGHT_TUCK_POSE = [
+    -0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
+TUCK_TORSO = 0.10
 
 
 def wrap_angle(a: float) -> float:
@@ -346,6 +335,7 @@ class ApproachNode(Node):
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
         self.pub_arm_left = self.create_publisher(JointTrajectory, TOPIC_ARM_LEFT, 10)
         self.pub_arm_right = self.create_publisher(JointTrajectory, TOPIC_ARM_RIGHT, 10)
+        self.pub_torso = self.create_publisher(JointTrajectory, TOPIC_TORSO, 10)
 
         self.create_timer(0.1, self._tick)
         self.get_logger().info(
@@ -650,66 +640,38 @@ class ApproachNode(Node):
         pub.publish(traj)
         return True
 
-    @staticmethod
-    def _mirrored_tuck() -> List[float]:
-        """Right arm mirrors the left tuck: flip the shoulder pan and upper-arm roll."""
-        pose = list(TUCK_POSE)
-        pose[0] = -pose[0]
-        pose[2] = -pose[2]
-        return pose
-
-    def _send_tuck(self) -> bool:
-        """Command both arms to the driving posture.
-
-        Only once something is listening on both controllers. Returns whether both
-        commands actually went out this call.
-        """
-        ok = True
+    def _send_tuck(self) -> None:
+        """Command both arms and torso using the src1 single-point tuck."""
         for pub, side in ((self.pub_arm_left, "left"), (self.pub_arm_right, "right")):
-            names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
-            pose = self._mirrored_tuck() if side == "right" else TUCK_POSE
-            ok = self._send(pub, names, pose, self.tuck_time) and ok
-        if ok:
-            self.get_logger().info("stowing arms for driving")
-        return ok
+            trajectory = JointTrajectory()
+            trajectory.joint_names = [
+                f"arm_{side}_{i}_joint" for i in range(1, 8)]
+            point = JointTrajectoryPoint()
+            point.positions = [
+                float(v) for v in (
+                    RIGHT_TUCK if side == "right" else TUCK_POSE)]
+            point.time_from_start = Duration(
+                sec=int(self.tuck_time), nanosec=0)
+            trajectory.points = [point]
+            pub.publish(trajectory)
 
-    def _tuck_gap(self) -> Optional[float]:
-        """Sum the joint-space distance from the tuck target.
-
-        Returns None until every joint the tuck touches has reported at least once.
-        """
-        names = ([f"arm_left_{i}_joint" for i in range(1, 8)]
-                 + [f"arm_right_{i}_joint" for i in range(1, 8)])
-        targets = list(TUCK_POSE) + self._mirrored_tuck()
-        try:
-            actual = [self.joints[name] for name in names]
-        except KeyError:
-            return None
-        return float(sum(abs(a - t) for a, t in zip(actual, targets)))
+        torso = JointTrajectory()
+        torso.joint_names = ["torso_lift_joint"]
+        lift = JointTrajectoryPoint()
+        lift.positions = [TUCK_TORSO]
+        lift.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
+        torso.points = [lift]
+        self.pub_torso.publish(torso)
+        self.get_logger().info("stowing arms + torso for driving")
 
     def _do_tuck(self) -> None:
         self._stop()  # no driving until the arms are in
-
-        if not self.tuck_sent:
-            self.tuck_sent = self._send_tuck()
-            if self.tuck_sent:
-                self.tuck_sent_at = self._now()
-
-        # Verify arrival from /joint_states rather than assuming the trajectory was
-        # followed -- grasp_node measured this arm taking about three times the
-        # commanded time_from_start to actually get there. tools/tuck_arm.py's own
-        # check (sum of joint-space error, warn past 0.5 rad) is mirrored here.
-        if self.tuck_sent:
-            gap = self._tuck_gap()
-            if gap is not None and gap <= 0.5:
-                self._enter(State.SEARCH)
-                return
-
-        # Don't wait forever if the tuck is never confirmed -- proceed anyway rather
-        # than stall the whole run over a simulation hiccup.
-        if self._elapsed() >= self.tuck_time + 5.0:
-            self.get_logger().warn(
-                "tuck not confirmed via /joint_states in time; proceeding anyway")
+        elapsed = self._elapsed()
+        # Brief repeats cover controller discovery. Later repeats restart the spline
+        # and prevent the fold from completing.
+        if elapsed < 0.6:
+            self._send_tuck()
+        if elapsed >= self.tuck_time + 2.0:
             self._enter(State.SEARCH)
 
     def _do_search(self) -> None:
