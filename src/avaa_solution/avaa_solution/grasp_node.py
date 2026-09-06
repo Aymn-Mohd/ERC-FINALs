@@ -1549,7 +1549,6 @@ class GraspNode(Node):
                 retry = self.chain.ik(
                     self.pre_target, seed=current,
                     approach=GRASP_APPROACH, closing=GRASP_CLOSING,
-                    prefer=self._posture_cost(float(self.pre_target[2])),
                     pin={"torso_lift_joint":
                          (float(self.pre_solution[0]), TORSO_SEARCH_SLACK)})
                 if (retry is None or not self._clear(retry)

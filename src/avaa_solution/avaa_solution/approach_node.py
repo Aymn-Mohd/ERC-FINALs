@@ -1257,6 +1257,10 @@ class ApproachNode(Node):
         column_cx = self._column_cx_fresh()
         if column_cx is None:
             self._stop()
+            self.get_logger().warn(
+                "lost the target marker while centring; searching again",
+                throttle_duration_sec=2.0)
+            self._enter(State.SEARCH)
             return
         error_px = column_cx - self.image_width / 2.0
         if abs(error_px) <= self.centre_tol:
