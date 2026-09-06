@@ -191,6 +191,10 @@ def facing_shelf() -> Quaternion:
 # eight-sample execution found the obstruction and failed beside the shelf.
 REACH_STEPS = 8
 PREGRASP_TRIALS = 24
+TORSO_MIN = 0.0
+TORSO_MAX = 0.35
+TORSO_SEARCH_LEVELS = (0.0, 0.175, 0.35, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30)
+TORSO_SEARCH_SLACK = 0.015
 
 
 class State(Enum):
@@ -288,7 +292,7 @@ class GraspNode(Node):
         # terms, so a centimetre of error here is corrected rather than carried,
         # and holding it to the same 12 mm as the grasp itself failed runs on a
         # millimetre while the arm sat 13 mm out and stable.
-        self.declare_parameter("pregrasp_tol_m", 0.045)
+        self.declare_parameter("pregrasp_tol_m", 0.015)
         # Reject postures the arm will not hold. Stalled 0.18 rad short of its last
         # waypoint with no contact anywhere in Gazebo, the arm had arm_left_2 at
         # 42 Nm of 43, arm_left_3 at 27 of 26 and arm_left_4 at 25 of 26 -- three
@@ -322,15 +326,13 @@ class GraspNode(Node):
         # this settle plus the arrival check. Arriving early is cheap -- the check simply
         # fails and the reach is retried -- while waiting is not.
         self.declare_parameter("settle_sec", 1.8)
-        # Perception can jump to a neighbouring book (measured: 450 mm then 527 mm in
-        # one run while three blue candidates were in view). That is not base slide;
-        # accepting it turns a validated pre-grasp into an unreachable line. Cap the
-        # correction so only real drift is followed.
-        self.declare_parameter("max_reaim_m", 0.10)
-        # Lateral jumps are tighter: 80 mm of "base slide" sideways put the straight
-        # reach through a shelf divider after a posture that had been validated for a
-        # different bay (gripper jammed into the post at pre-grasp).
-        self.declare_parameter("max_reaim_lateral_m", 0.04)
+        # Reject actual neighbouring-book jumps (measured at 450-527 mm), but retain
+        # real arm-induced base slide. A run with one stable candidate accumulated
+        # 197 mm sideways while the arm extended; the old 40/100 mm cumulative caps
+        # held the stale target and visibly left the gripper beside the book. Every
+        # accepted correction is re-solved and collision checked before execution.
+        self.declare_parameter("max_reaim_m", 0.25)
+        self.declare_parameter("max_reaim_lateral_m", 0.25)
 
         self.row_heights = list(
             self.get_parameter("row_heights").get_parameter_value().double_array_value
@@ -1020,11 +1022,20 @@ class GraspNode(Node):
         # going to work: eight random tries found nothing at a 0.60 m standoff while a
         # seeded walk through the same reach was clear at every step.
         seed = self._current_joints()
+        ideal = self._torso_for(
+            float(self.pre_target[2]))["torso_lift_joint"][0]
+        torso_levels = [ideal] + [
+            level for level in TORSO_SEARCH_LEVELS
+            if abs(level - ideal) > TORSO_SEARCH_SLACK
+        ]
         for attempt in range(attempts):
+            torso = torso_levels[attempt % len(torso_levels)]
             if attempt == 0 or (attempt + 1) % 3 == 0:
                 self.get_logger().info(
-                    "pre-grasp search: try %d/%d (%d clear so far, %d in collision)"
-                    % (attempt + 1, attempts, len(candidates), rejected))
+                    "pre-grasp search: try %d/%d at torso %.3f m "
+                    "(%d clear so far, %d in collision)"
+                    % (attempt + 1, attempts, torso,
+                       len(candidates), rejected))
             # Keep a useful collision-free near-miss as the local seed while the IK
             # solver's own random restarts continue exploring other elbow postures.
             trial_seed = seed if best is None else best[1]
@@ -1032,7 +1043,7 @@ class GraspNode(Node):
                 self.pre_target, seed=trial_seed,
                 approach=GRASP_APPROACH, closing=GRASP_CLOSING,
                 prefer=self._posture_cost(float(self.pre_target[2])),
-                pin=self._torso_for(float(self.pre_target[2])))
+                pin={"torso_lift_joint": (torso, TORSO_SEARCH_SLACK)})
             if solution is None:
                 continue
             if not self._clear(solution):
@@ -1072,9 +1083,9 @@ class GraspNode(Node):
                 # count of attempts made -- the search stops collecting once it has
                 # enough, so the winning attempt can be numbered higher than the total
                 # and the line read "try 6 of 5".
-                "pre-grasp posture from try %d that reached, %d considered: worst "
-                "joint at %.0f%% of rated"
-                % (tries, len(candidates), share * 100.0))
+                "pre-grasp posture from try %d that reached, %d considered: "
+                "torso %.3f m, worst joint at %.0f%% of rated"
+                % (tries, len(candidates), solution[0], share * 100.0))
             return solution
 
         if best is None:
@@ -1210,6 +1221,9 @@ class GraspNode(Node):
         start_point = np.asarray(start_point, dtype=float)
         end_point = np.asarray(end_point, dtype=float)
         seed = list(start_solution)
+        torso_pin = {
+            "torso_lift_joint": (float(start_solution[0]), TORSO_SEARCH_SLACK)
+        }
         for step in range(1, steps + 1):
             point = start_point + (step / float(steps)) * (end_point - start_point)
             # No posture cost here: the seed from the previous waypoint and the
@@ -1219,7 +1233,7 @@ class GraspNode(Node):
             # and it turned a posture search into a three-minute wait.
             solution = self.chain.ik(point, seed=seed, approach=GRASP_APPROACH,
                                      closing=GRASP_CLOSING,
-                                     pin=self._torso_for(float(point[2])))
+                                     pin=torso_pin)
             if solution is None or not self._clear(solution):
                 return (step - 1) / float(steps)
             seed = solution
@@ -1238,11 +1252,14 @@ class GraspNode(Node):
         end_point = np.asarray(end_point, dtype=float)
         waypoints = [list(start_solution)]
         seed = list(start_solution)
+        torso_pin = {
+            "torso_lift_joint": (float(start_solution[0]), TORSO_SEARCH_SLACK)
+        }
         for step in range(1, steps + 1):
             point = start_point + (step / float(steps)) * (end_point - start_point)
             solution = self.chain.ik(point, seed=seed, approach=GRASP_APPROACH,
                                      closing=GRASP_CLOSING,
-                                     pin=self._torso_for(float(point[2])))
+                                     pin=torso_pin)
             if solution is None:
                 self.get_logger().warn(
                     "no posture reaches %.0f%% of the way along the line"
@@ -1274,11 +1291,15 @@ class GraspNode(Node):
 
         mid = self.chain.ik(
             via, seed=list(start_solution), approach=GRASP_APPROACH,
-            closing=GRASP_CLOSING, pin=self._torso_for(float(via[2])))
+            closing=GRASP_CLOSING,
+            pin={"torso_lift_joint":
+                 (float(start_solution[0]), TORSO_SEARCH_SLACK)})
         if mid is None or not self._clear(mid):
             mid = self.chain.ik(
                 back, seed=list(start_solution), approach=GRASP_APPROACH,
-                closing=GRASP_CLOSING, pin=self._torso_for(float(back[2])))
+                closing=GRASP_CLOSING,
+                pin={"torso_lift_joint":
+                     (float(start_solution[0]), TORSO_SEARCH_SLACK)})
             if mid is None or not self._clear(mid):
                 return None
             via = back
@@ -1380,7 +1401,7 @@ class GraspNode(Node):
         # produced a posture reported as 100 per cent clear and then an invalid motion
         # plan the moment the real boards went in.
         self.get_logger().info(
-            "searching for a pre-grasp posture that can reach into the shelf "
+            "searching the full 0.00-0.35 m torso range for a pre-grasp posture "
             "(up to %d IK trials; every reach is collision checked)..."
             % PREGRASP_TRIALS)
         self.pre_solution = self._posture_that_can_reach_in()
@@ -1398,17 +1419,18 @@ class GraspNode(Node):
         # middle rows it comes back "invalid motion plan". Raising first turns one hard
         # problem into two easy ones: the torso moves with the arm out of the way, and
         # the arm then unfolds at the height it will work at.
-        ideal = self._torso_for(float(self.pre_target[2]))["torso_lift_joint"][0]
-        self.raised = [ideal] + list(TUCK_POSE)
+        selected_torso = float(self.pre_solution[0])
+        self.raised = [selected_torso] + list(TUCK_POSE)
         # Controllers, not MoveIt: RAISE is a known fold + torso height, and MoveIt
         # refuses to start if the idle right arm is still settling into its tuck.
         self.raise_deadline = self.get_clock().now() + RclDuration(seconds=25.0)
-        self._send_torso(ideal, seconds=15.0)
+        self._send_torso(selected_torso, seconds=15.0)
         # Hold the final home pose (already folded); do not re-run the full fold path.
         self._send_arm_tuck(self.pub_arm_left, ARM_JOINTS, TUCK_POSE)
         self._send_arm_tuck(self.pub_arm_right, RIGHT_ARM_JOINTS, RIGHT_TUCK_POSE)
         self.get_logger().info(
-            "raising torso to %.2f m with arms folded (joint trajectories)" % ideal)
+            "moving torso to selected IK height %.3f m with arms folded "
+            "(joint trajectories)" % selected_torso)
         self._enter(State.RAISE)
 
     def _do_raise(self) -> None:
@@ -1446,7 +1468,8 @@ class GraspNode(Node):
         moved = self.chain.ik(
             self.pre_target, seed=list(self.pre_solution),
             approach=GRASP_APPROACH, closing=GRASP_CLOSING,
-            pin=self._torso_for(float(self.pre_target[2])))
+            pin={"torso_lift_joint":
+                 (float(self.pre_solution[0]), TORSO_SEARCH_SLACK)})
         # Staging clearance is not enough: a re-aim that only checks the pre-grasp
         # point can put the straight line into the shelf through a divider (measured:
         # 81 mm re-aim, then "obstructed 100% of the way in" with the gripper in the
@@ -1521,7 +1544,8 @@ class GraspNode(Node):
                     self.pre_target, seed=current,
                     approach=GRASP_APPROACH, closing=GRASP_CLOSING,
                     prefer=self._posture_cost(float(self.pre_target[2])),
-                    pin=self._torso_for(float(self.pre_target[2])))
+                    pin={"torso_lift_joint":
+                         (float(self.pre_solution[0]), TORSO_SEARCH_SLACK)})
                 if (retry is None or not self._clear(retry)
                         or self._reach_clearance(
                             retry, self.pre_target,
@@ -1556,8 +1580,19 @@ class GraspNode(Node):
         # Do not re-aim here. The pre-grasp posture was solved for the locked target;
         # a 0.5 m perception jump (seen in logs with multiple blue candidates) makes
         # the straight line from that posture unreachable.
-        start_point = np.asarray(self.chain.fk(list(self.pre_solution))[:3, 3],
-                                 dtype=float)
+        # Start Cartesian IK from measured FK, not from the posture we asked the
+        # controller to reach. The arm can settle centimetres away from that command;
+        # this run was accepted 32 mm high, making every waypoint's assumed starting
+        # position false.
+        current = self._current_joints()
+        here = self._gripper_now()
+        if current is None or here is None:
+            self.get_logger().error(
+                "cannot read the live arm at pre-grasp; refusing a blind reach")
+            self._enter(State.FAILED)
+            return
+        start_solution = current
+        start_point = here
 
         # Stop short of the book, so the last stretch can be aimed separately.
         leg_end = np.asarray(self.grasp_target, dtype=float)
@@ -1570,25 +1605,16 @@ class GraspNode(Node):
             self.leg = 2
         self.leg_target = leg_end
 
-        path = self._straight_path(self.pre_solution, start_point, leg_end)
+        path = self._straight_path(start_solution, start_point, leg_end)
         if path is None:
-            # Last chance: the arm may have settled off the SCENE posture (logged
-            # +44 mm sideways) so re-seed from where it actually is.
-            here = self._gripper_now()
-            current = self._current_joints()
-            if here is not None and current is not None:
-                self.get_logger().warn(
-                    "planned line blocked; retrying the reach from the arm as it is")
-                path = self._straight_path(current, here, leg_end)
-            if path is None:
-                found = self._posture_that_can_reach_in()
-                if found is not None:
-                    self.pre_solution = found
-                    start_point = np.asarray(
-                        self.chain.fk(list(found))[:3, 3], dtype=float)
-                    path = self._straight_path(found, start_point, leg_end)
-                    if path is not None and current is not None:
-                        path = [list(current)] + list(path)
+            found = self._posture_that_can_reach_in()
+            if found is not None:
+                self.pre_solution = found
+                start_point = np.asarray(
+                    self.chain.fk(list(found))[:3, 3], dtype=float)
+                path = self._straight_path(found, start_point, leg_end)
+                if path is not None:
+                    path = [list(current)] + list(path)
             if path is None:
                 self.get_logger().error(
                     "no clear line from pre-grasp %s into the shelf toward %s"

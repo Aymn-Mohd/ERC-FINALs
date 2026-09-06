@@ -17,6 +17,9 @@ from avaa_solution.grasp_node import (
     PREGRASP_TRIALS,
     REACH_STEPS,
     RIGHT_TUCK_POSE,
+    TORSO_MAX,
+    TORSO_MIN,
+    TORSO_SEARCH_LEVELS,
     TUCK_POSE,
     TUCK_TORSO,
     row_to_height,
@@ -130,6 +133,9 @@ def test_tuck_fold_is_single_point():
 def test_grasp_search_uses_full_resolution_and_trial_budget():
     assert REACH_STEPS == 8
     assert PREGRASP_TRIALS == 24
+    assert TORSO_MIN in TORSO_SEARCH_LEVELS
+    assert (TORSO_MIN + TORSO_MAX) / 2.0 in TORSO_SEARCH_LEVELS
+    assert TORSO_MAX in TORSO_SEARCH_LEVELS
 
 
 def test_grasp_frame_places_pad_center_at_book_depth_center():
