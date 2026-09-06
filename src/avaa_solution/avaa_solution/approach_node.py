@@ -1098,6 +1098,15 @@ class ApproachNode(Node):
         """
         if self._book_located() and self.book_x is not None:
             return self.book_x
+        # Once the book has been anchored, losing it at close range is expected as it
+        # leaves the camera view. Keep using that anchored front-face position. Falling
+        # back to LiDAR here is unsafe: the scan sees through the open bay to the shelf
+        # back, overstates clearance, and keeps driving the base into the shelf.
+        if self.target_odom is not None:
+            target = self._target_in_base()
+            if target is None:
+                return None
+            return float(target[0])
         return self._range_ahead()
 
     def _book_located(self, max_age: float = 1.5) -> bool:
@@ -1287,7 +1296,9 @@ class ApproachNode(Node):
     def _do_approach(self) -> None:
         ahead = self._distance_to_face()
         if ahead is None:
-            self.get_logger().warn("no forward LiDAR returns; holding", throttle_duration_sec=3.0)
+            self.get_logger().warn(
+                "no trustworthy distance to the book face; holding",
+                throttle_duration_sec=3.0)
             self._stop()
             return
         remaining = ahead - self.approach_target
