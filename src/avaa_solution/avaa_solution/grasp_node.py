@@ -193,11 +193,13 @@ def facing_shelf() -> Quaternion:
 # scoring samples a collision at the final sample appeared as "75% clear", then the
 # eight-sample execution found the obstruction and failed beside the shelf.
 REACH_STEPS = 8
-PREGRASP_TRIALS = 24
+PREGRASP_TRIALS = 10
 TORSO_MIN = 0.0
 TORSO_MAX = 0.35
-TORSO_SEARCH_LEVELS = (0.0, 0.175, 0.35, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30)
-TORSO_SEARCH_SLACK = 0.015
+# Five overlapping bands cover the full legal range without requiring an exact,
+# potentially unreachable torso height. Two passes give each band another elbow seed.
+TORSO_SEARCH_LEVELS = (0.0, 0.175, 0.35, 0.0875, 0.2625)
+TORSO_SEARCH_SLACK = 0.045
 
 
 class State(Enum):
@@ -1048,8 +1050,8 @@ class GraspNode(Node):
             solution = self.chain.ik(
                 self.pre_target, seed=trial_seed,
                 approach=GRASP_APPROACH, closing=GRASP_CLOSING,
-                prefer=self._posture_cost(float(self.pre_target[2])),
-                pin={"torso_lift_joint": (torso, TORSO_SEARCH_SLACK)})
+                pin={"torso_lift_joint": (torso, TORSO_SEARCH_SLACK)},
+                max_restarts=4)
             if solution is None:
                 continue
             if not self._clear(solution):

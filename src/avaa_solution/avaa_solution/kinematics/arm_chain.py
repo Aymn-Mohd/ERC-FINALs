@@ -293,7 +293,8 @@ class ArmChain:
            approach: Optional[Sequence[float]] = None,
            closing: Optional[Sequence[float]] = None,
            orientation_tolerance: float = 0.26,
-           prefer=None, pin: Optional[dict] = None) -> Optional[List[float]]:
+           prefer=None, pin: Optional[dict] = None,
+           max_restarts: Optional[int] = None) -> Optional[List[float]]:
         """Joint values placing the gripper at target (x, y, z) in base_link.
 
         With approach and closing left out this solves position only, which is
@@ -396,7 +397,9 @@ class ArmChain:
         # narrows the basin, so allow more attempts when orientation matters. When the
         # caller wants to choose between postures, keep going to collect several rather
         # than stopping at the first that reaches.
-        for attempt in range(40 if prefer is not None else (20 if want_orientation else 6)):
+        restarts = (max_restarts if max_restarts is not None else
+                    (40 if prefer is not None else (20 if want_orientation else 6)))
+        for attempt in range(max(1, restarts)):
             start = seed if attempt == 0 else [
                 np.random.uniform(lo, hi) for lo, hi in zip(lower, upper)
             ]

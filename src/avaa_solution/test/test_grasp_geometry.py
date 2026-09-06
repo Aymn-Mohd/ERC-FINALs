@@ -133,7 +133,7 @@ def test_tuck_fold_is_single_point():
 
 def test_grasp_search_uses_full_resolution_and_trial_budget():
     assert REACH_STEPS == 8
-    assert PREGRASP_TRIALS == 24
+    assert PREGRASP_TRIALS == 10
     assert TORSO_MIN in TORSO_SEARCH_LEVELS
     assert (TORSO_MIN + TORSO_MAX) / 2.0 in TORSO_SEARCH_LEVELS
     assert TORSO_MAX in TORSO_SEARCH_LEVELS
