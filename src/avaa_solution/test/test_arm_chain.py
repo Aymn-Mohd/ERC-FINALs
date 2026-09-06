@@ -100,10 +100,10 @@ def test_clamp_respects_limits(chain):
 
 
 @pytest.mark.parametrize("target", [
-    [0.80, 0.0, 1.391],   # shelf row 1, book centred on the base
-    [0.80, 0.0, 1.061],   # row 2
-    [0.80, 0.0, 0.731],   # row 3
-    [0.80, 0.0, 0.401],   # row 4
+    [0.80, 0.0, 1.501],   # shelf row 1, book centred on the base
+    [0.80, 0.0, 1.171],   # row 2
+    [0.80, 0.0, 0.841],   # row 3
+    [0.80, 0.0, 0.511],   # row 4
 ])
 def test_every_shelf_row_is_reachable(chain, target):
     solution = chain.ik(target)
@@ -112,7 +112,7 @@ def test_every_shelf_row_is_reachable(chain, target):
 
 
 def test_ik_solution_respects_joint_limits(chain):
-    solution = chain.ik([0.80, 0.0, 1.061])
+    solution = chain.ik([0.80, 0.0, 1.171])
     assert solution is not None
     for value, (lo, hi) in zip(solution, chain.limits):
         assert lo - 1e-6 <= value <= hi + 1e-6

@@ -56,18 +56,12 @@ TOPIC_TARGET_BOOK_POINT = "/avaa/perception/target_book_point"
 # Where the grasp controller wants the book expressed.
 GRASP_FRAME = "base_link"
 
-# Shelf heights in base_link, top row first, and how far the deprojected height sits
-# above the truth. Measured against Gazebo over 100 published points: +152 mm at 0.7-0.9 m
-# with 41 mm of spread, +193 at 0.9-1.2, +146 at 1.2-1.6, +121 beyond. The bias is not
-# constant enough to name a row on its own -- 0.6 of a row spacing at worst -- but it is
-# nowhere near the 660 mm needed to confuse rows two apart, which is what makes it a
-# usable check on an answer arrived at a completely different way.
-#
-# ASSUMPTION: the bias comes from the bounding box sitting high on the visible face of a
-# book whose lower edge is occluded by the shelf lip. It is treated as a constant here
-# because it does not need to be better than half a row to do this job.
-ROW_HEIGHTS_BASE = [1.391, 1.061, 0.731, 0.401]
-DEPTH_HEIGHT_BIAS = 0.152
+# Book centre heights in base_link, top row first. The former table represented
+# shelf-board heights and was 110 mm below each book centre. Once compared against
+# the true centres, the deprojected point is about 42 mm high because the camera sees
+# more of the upper face.
+ROW_HEIGHTS_BASE = [1.501, 1.171, 0.841, 0.511]
+DEPTH_HEIGHT_BIAS = 0.042
 
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
